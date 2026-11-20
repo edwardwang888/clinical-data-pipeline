@@ -51,12 +51,17 @@ Synthetic data only. No real patient data ever goes in this repo.
 
 ### 1. Producer
 
-- **Simulated Hospital** (Google, open source, Docker) generates realistic ADT and result
-  messages and sends them over MLLP:
-  `-output mllp -mllp_destination <host>:<port>`.
-  Inside Docker, `127.0.0.1` is the container, so point it at the host's address.
-- Alternative: a small Python producer that fills HL7 templates with fake data. Gives full
-  control over edge cases.
+- **Python producer (current, `producer/`)** fills HL7 templates (ADT A01/A08/A03,
+  ORU^R01) with synthetic data and sends them over MLLP. It behaves like a hospital
+  interface engine: one message at a time, wait for the ACK, and resend the same message
+  on `AE`, timeout or a dropped connection until it gets `AA`. Full control over edge
+  cases, and the integration tests use it to know exactly which messages were ACKed.
+- **Simulated Hospital** (Google, open source) generates more realistic ADT and result
+  messages over MLLP (`-output mllp -mllp_destination <host>:<port>`). Its published image
+  (`eu.gcr.io/simhospital-images/simhospital`) currently refuses unauthenticated pulls,
+  and the source only builds with Bazel, so it is deferred: revisit at milestone 3–4,
+  when realistic variety starts to matter, as a second producer. Inside Docker,
+  `127.0.0.1` is the container, so point it at the listener's service name.
 - Later: Synthea CSVs as a stand-in for a historical reporting-database extract.
 
 ### 2. Messiness injector
@@ -78,11 +83,12 @@ Every injected change is logged so checks can be scored against what was actuall
 
 - Async TCP server (python-hl7 `hl7.mllp`) on port 2575.
 - For each message:
-  1. Read the frame (`0x0B` … `0x1C 0x0D`).
+  1. Read the frame (`0x0B` … `0x1C 0x0D`). Bytes before the `0x0B` (e.g. a newline some
+     senders put between frames) are skipped, not treated as a broken frame.
   2. Write the exact bytes plus metadata to the raw archive.
   3. Publish a "new message" event to the queue.
-  4. Send ACK `AA` only after steps 2–3 succeed. If storage fails, send `AE` or drop the
-     connection so the sender retries.
+  4. Send ACK `AA` only after steps 2–3 succeed. If either fails, send `AE` so the
+     sender resends (a raw file without an event is just a future duplicate).
 - **No parsing before the ACK.** A message that can't be parsed must not block the feed;
   it gets quarantined downstream.
 - Read only the minimum header fields needed for the file name and metadata (sending
@@ -92,10 +98,18 @@ Every injected change is logged so checks can be scored against what was actuall
 
 - Local folder now; GCS or S3 later behind a `RawStore` interface (`save_raw(bytes, meta)`).
 - Layout:
-  `raw/hospital=<id>/feed=<adt|lab|...>/date=<YYYY-MM-DD>/<received_ts>_<sha256[:12]>.hl7`
+  `raw/hospital=<id>/feed=<type>/date=<YYYY-MM-DD>/<received_ts>_<sha256[:12]>.hl7`
   plus a `.json` file next to it holding the metadata (received_at, peer address, sha256,
   control ID, message type, listener version).
-- Never overwrite: unique names and create-only writes. A resent message becomes a new file.
+  - `hospital` is the first component of MSH-4 (sending facility) and `feed` is the
+    message code from MSH-9 (`adt`, `oru`, ...), lowercased and reduced to `[a-z0-9_-]`
+    so header values can't escape the folder. Both are `unknown` if the header can't be
+    read. `date` and `received_ts` are UTC, from when we received the message.
+- Never overwrite: unique names and create-only writes. A resent message becomes a new file;
+  the same bytes in the same microsecond get a `_1`, `_2` suffix.
+- Write to a hidden temp file, fsync, then hard-link to the final name. The link fails if
+  the name exists (so nothing is overwritten), and a final name only ever points at a
+  complete file: a crash mid-write leaves a stray `.tmp-*` file, never a truncated message.
 - Store bytes, not decoded text: segment separators are `\r`, and the character encoding
   varies (MSH-18).
 
@@ -103,7 +117,11 @@ Every injected change is logged so checks can be scored against what was actuall
 
 - Redis Streams locally (consumer groups, `XACK`, pending entries, `XAUTOCLAIM` for
   redelivery). Pub/Sub later behind a `Publisher` interface.
-- The event carries a pointer to the raw file, not the message itself.
+- The event carries a pointer to the raw file, not the message itself: `raw_key`,
+  `raw_message_id` (sha256), `source_system`, hospital, feed, message type, control ID,
+  received_at.
+- Redis runs with an append-only file fsynced on every write, so an event the listener
+  published (and then ACKed) survives a Redis restart.
 - At-least-once and not ordered: consumers must handle duplicates and must not depend on
   arrival order.
 - Messages that keep failing go to a dead-letter stream with the error attached.
@@ -164,6 +182,10 @@ Every injected change is logged so checks can be scored against what was actuall
 | When to ACK | After raw write + queue publish | ACK on receipt | Never acknowledge something we could lose |
 | Raw format | Exact bytes + metadata file | Parsed JSON only | Parser bugs can be fixed and replayed |
 | Raw layout | One file per message | Batched files | Simple and immediate; combine into Parquet later for analytics |
+| Create-only writes | Temp file + fsync + hard link | `open(..., "x")` directly | Never overwrites, and a crash can't leave a truncated file under a real name |
+| Queue durability | Redis AOF, `appendfsync always` | Default snapshots / `everysec` | An ACKed event must survive a Redis restart; the speed cost doesn't matter at this scale |
+| Producer | Python producer now; Simulated Hospital later | Build Simulated Hospital from source now | Its image won't pull and the source needs Bazel; milestone 1 only needs correct MLLP + resend behavior |
+| Frame reading | Own `read_frame` on python-hl7's streams | python-hl7 `readblock()` | `readblock()` drops a whole message if any byte precedes `0x0B` |
 | Triggering processing | Listener publishes to queue | Storage-event notification (GCS → Pub/Sub) | Both are fine; interface keeps it swappable |
 | Parsing | Own parser (python-hl7) | GCP HL7v2 store + HL7→FHIR | Full control over mapping, history and replay |
 | Warehouse | DuckDB + dbt | BigQuery | Free and local; dbt models carry over |
@@ -183,13 +205,17 @@ Every injected change is logged so checks can be scored against what was actuall
 | Feed goes silent | Freshness alert per feed, aware of time of day |
 | Burst after downtime | Queue absorbs it; listener only stores and ACKs |
 | Listener crashes mid-message | No ACK sent, so the sender retries; duplicates handled downstream |
+| Listener crashes mid-write | Temp file + hard link: no truncated file under a final name; stray `.tmp-*` files are harmless |
+| Redis down or publish fails | Listener sends `AE`; sender resends; the orphan raw file is a harmless duplicate |
+| Redis restarts | AOF with fsync on every write keeps already-ACKed events |
+| Stray bytes between frames | Skipped before the `0x0B`; the message itself is kept |
 | Consumer falls behind | Lag alert; pending messages redelivered |
 
 ## Local stack
 
 | Part | Tool |
 |---|---|
-| Producer | Simulated Hospital (Docker) or Python producer |
+| Producer | Python producer (Simulated Hospital later) |
 | Listener | Python asyncio + python-hl7 |
 | Raw archive | Local folder (GCS later) |
 | Queue | Redis Streams (Pub/Sub later) |
@@ -201,7 +227,7 @@ Every injected change is logged so checks can be scored against what was actuall
 
 ## Build plan
 
-1. **Getting data in:** docker-compose with Simulated Hospital, the listener, the raw
+1. **Getting data in:** docker-compose with the Python producer, the listener, the raw
    archive and Redis. Done when messages are stored, ACKed and queued, and killing the
    listener mid-stream loses nothing.
 2. **Messiness injector:** proxy with configurable chaos and a log of what it injected.
