@@ -27,7 +27,7 @@ import redis
 
 from pipeline.publisher import RAW_STREAM
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("pipeline.consumer")  # stable name even when run with -m
 
 DEFAULT_GROUP = "raw-logger"
 BATCH = 100
