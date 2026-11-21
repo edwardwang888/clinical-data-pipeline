@@ -127,3 +127,16 @@ class ListenerProcess:
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(sig)
             self.proc.wait(timeout=15)
+
+
+def start_consumer(redis_url, stream, log_path):
+    """Start the real consumer (`python -m pipeline.consumer`); its log goes to `log_path`."""
+    env = {**os.environ, "REDIS_URL": redis_url, "RAW_STREAM": stream, "CONSUMER_NAME": "c1"}
+    with open(log_path, "a") as log:
+        return subprocess.Popen(
+            [sys.executable, "-m", "pipeline.consumer"],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )

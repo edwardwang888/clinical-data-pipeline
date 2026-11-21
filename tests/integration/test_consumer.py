@@ -1,11 +1,15 @@
 """The stand-in consumer against a real Redis: XACK after handling, redelivery after a
 crash, and claiming events a dead consumer left behind."""
 
+import signal
+import time
+
 import pytest
 import redis
 
 from pipeline.consumer import DEFAULT_GROUP, RawEventConsumer
 from pipeline.publisher import RedisStreamPublisher
+from tests.conftest import free_port, start_consumer
 
 pytestmark = pytest.mark.integration
 
@@ -154,3 +158,54 @@ def test_consumer_rereads_its_pending_events_after_reconnecting(redis_client, st
 
     assert seen == ["C0"]
     assert pending_count(redis_client, stream_name) == 0
+
+
+# --- shutdown of the real consumer process (what `docker stop` and Ctrl-C do) --------
+
+
+def wait_for(condition, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out waiting"
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["sigterm", "sigint"])
+def test_consumer_process_stops_cleanly_on_signal(tmp_path, redis_url, redis_client, stream_name, sig):
+    log_path = tmp_path / "consumer.log"
+    consumer = start_consumer(redis_url, stream_name, log_path)
+    try:
+        publish(redis_client, stream_name, 1)
+        wait_for(lambda: redis_client.exists(stream_name) and _entries_read(redis_client, stream_name) == 1)
+
+        consumer.send_signal(sig)
+        assert consumer.wait(timeout=3) == 0  # stops within one read wait (1 s), cleanly
+    finally:
+        consumer.kill()
+
+    assert "stopped" in log_path.read_text()
+    assert pending_count(redis_client, stream_name) == 0  # nothing left half-handled
+
+
+def test_consumer_process_stops_promptly_while_waiting_for_redis(tmp_path):
+    # Redis unreachable: the consumer is waiting between reconnect attempts (delays grow
+    # to 10 s). A stop request must still be noticed right away, not after the delay.
+    log_path = tmp_path / "consumer.log"
+    consumer = start_consumer(f"redis://127.0.0.1:{free_port()}/0", "hl7.raw", log_path)
+    try:
+        wait_for(lambda: "retrying in 4.0s" in log_path.read_text())  # well into the waits
+
+        started = time.monotonic()
+        consumer.send_signal(signal.SIGTERM)
+        assert consumer.wait(timeout=3) == 0
+        assert time.monotonic() - started < 1.0  # not the remaining ~4 s
+    finally:
+        consumer.kill()
+
+    assert "stopped" in log_path.read_text()
+
+
+def _entries_read(client, stream):
+    """How many events the consumer group has been handed so far (0 if no group yet)."""
+    groups = client.xinfo_groups(stream)
+    return groups[0]["entries-read"] if groups else 0
