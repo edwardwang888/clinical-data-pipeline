@@ -29,9 +29,11 @@ services:
     environment:
       LISTENER_PORT: "2575"
       RAW_DIR: /data/raw
+      RAW_REJECTED_DIR: /data/rejected
       REDIS_URL: redis://redis:6379/0
     volumes:
       - ./data/raw:/data/raw
+      - ./data/rejected:/data/rejected
     ports:
       - "2575:2575"
     depends_on:

@@ -7,8 +7,13 @@ sender resends); if we crash before ACKing, the sender times out and resends. Ei
 way the worst case is a duplicate, which downstream consumers handle. A loss is not
 possible.
 
-The listener does not parse. It reads only the few MSH fields it needs (see msh.py),
-and stores the message even when it can't read those.
+The listener does not parse. It reads only the few MSH fields it needs (see msh.py).
+If it can't read them, it can't identify the message: there is no control ID the
+sender could match an ACK to, and nothing to queue it under. It then keeps the exact
+bytes as evidence in a separate "rejected" store, never queues them, and replies AR
+("rejected, don't resend") so the sender's team can investigate. Messages with a
+readable header are always stored and ACKed, however wrong their contents; the parser
+quarantines those later, so problems inside a message never stall the feed.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from pipeline.publisher import Publisher
 from pipeline.raw_store import RawStore, safe_segment
 from services.listener.ack import build_ack
 from services.listener.framing import FramingError, FrameTooLarge, read_frame
-from services.listener.msh import read_msh
+from services.listener.msh import MshHeader, read_msh
 
 log = logging.getLogger(__name__)
 
@@ -30,9 +35,10 @@ SOURCE_SYSTEM = "hl7v2"
 
 
 class Listener:
-    def __init__(self, store: RawStore, publisher: Publisher) -> None:
-        self.store = store
+    def __init__(self, store: RawStore, publisher: Publisher, rejected_store: RawStore) -> None:
+        self.store = store  # the raw archive: every message we can identify
         self.publisher = publisher
+        self.rejected_store = rejected_store  # evidence for messages we reject (AR)
         self._connections: set[asyncio.Task] = set()
 
     async def handle_connection(self, reader: asyncio.StreamReader, writer) -> None:
@@ -78,11 +84,10 @@ class Listener:
         """Store `raw`, publish its event, and return the ACK bytes to send back.
 
         Returns AA only if both the save and the publish succeeded; otherwise AE.
+        A message whose header can't be read is kept as evidence and gets AR.
         """
         received_at = datetime.now(timezone.utc)
         header = read_msh(raw)
-        if header.error:
-            log.warning("unreadable header peer=%s: %s (storing anyway)", peer, header.error)
 
         meta = {
             "received_at": received_at,
@@ -96,6 +101,9 @@ class Listener:
             "source_system": SOURCE_SYSTEM,
             "listener_version": LISTENER_VERSION,
         }
+        if header.error:
+            return await self._reject(raw, header, meta, peer)
+
         try:
             # File I/O and the Redis call block, so run them in a worker thread to keep
             # other connections flowing meanwhile.
@@ -123,6 +131,20 @@ class Listener:
             event_id,
         )
         return build_ack(header, "AA")
+
+    async def _reject(self, raw: bytes, header: MshHeader, meta: dict, peer: str) -> bytes:
+        """Keep an unidentifiable message's bytes as evidence, then reply AR.
+
+        Even a rejection is only sent once the bytes are stored: if saving the evidence
+        fails we reply AE instead, and the sender tries again.
+        """
+        try:
+            saved = await asyncio.to_thread(self.rejected_store.save_raw, raw, meta)
+        except Exception:
+            log.exception("could not keep rejected message, sending AE peer=%s", peer)
+            return build_ack(header, "AE", text="message not stored; please resend")
+        log.warning("rejected (AR) peer=%s reason=%s evidence=%s", peer, header.error, saved.key)
+        return build_ack(header, "AR", text=f"rejected: {header.error}")
 
     async def close_connections(self) -> None:
         """Stop serving open connections (used on shutdown). In-flight messages that

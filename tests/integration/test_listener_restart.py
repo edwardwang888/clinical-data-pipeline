@@ -46,6 +46,7 @@ class ListenerProcess:
             "LISTENER_HOST": "127.0.0.1",
             "LISTENER_PORT": str(port),
             "RAW_DIR": str(raw_dir),
+            "RAW_REJECTED_DIR": str(raw_dir.parent / "rejected"),
             "REDIS_URL": redis_url,
             "RAW_STREAM": stream,
             "LOG_LEVEL": "WARNING",
@@ -132,6 +133,7 @@ def test_no_acked_message_is_lost_when_listener_restarts(
     # No truncated or foreign file ever appears under a final name: every .hl7 file
     # holds exactly the bytes of a message we sent. (A crash can leave .tmp-* files.)
     hl7_files = list(raw_dir.rglob("*.hl7"))
+    assert not (tmp_path / "rejected").exists()  # every message was valid: none rejected
     assert all(p.read_bytes() in sent_bytes for p in hl7_files)
 
     # Raw archive: every ACKed message has a file (with metadata) holding its exact bytes.

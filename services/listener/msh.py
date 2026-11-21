@@ -4,9 +4,11 @@ The listener needs a few header fields to name the raw file and to build the ACK
 sending facility (-> hospital), message type (-> feed), control ID and version.
 Everything else waits for the real parser downstream.
 
-`read_msh` never raises. If the header can't be read, it returns defaults with
-`error` set, and the listener still stores and ACKs the message: a message we can't
-read must never block the feed. It gets quarantined later, at parse time.
+`read_msh` never raises. If the header can't be read (no MSH segment, control ID or
+message type), it returns defaults with `error` set. The listener then can't identify
+the message: it keeps the bytes as evidence and replies AR (see server.py). Problems
+*inside* a message with a readable header are not checked here; those messages are
+stored and ACKed, and the parser quarantines them later.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import re
 from dataclasses import dataclass, replace
 
 DEFAULT_ENCODING_CHARS = "^~\\&"
+UTF8_BOM = b"\xef\xbb\xbf"
 
 
 @dataclass(frozen=True)
@@ -64,8 +67,13 @@ def read_msh(raw: bytes) -> MshHeader:
 
 
 def _read_msh(raw: bytes) -> MshHeader:
+    # Some senders put whitespace or a UTF-8 byte-order mark before MSH. Skip them for
+    # reading only; the stored message keeps every byte.
+    data = raw.lstrip()
+    if data.startswith(UTF8_BOM):
+        data = data[len(UTF8_BOM) :].lstrip()
     # Only look at the first segment. Segments should end in \r; tolerate \n too.
-    first_segment = re.split(rb"[\r\n]", raw.lstrip(), maxsplit=1)[0]
+    first_segment = re.split(rb"[\r\n]", data, maxsplit=1)[0]
     # Latin-1 maps every byte to exactly one character, so decoding can't fail, and
     # encoding the ACK back to Latin-1 returns the sender's exact bytes (e.g. for the
     # control ID). The raw message itself is never decoded; this is only for metadata.

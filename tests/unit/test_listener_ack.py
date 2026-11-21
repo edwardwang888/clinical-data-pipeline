@@ -1,7 +1,8 @@
 """The listener's core promise: AA is sent only after the save AND the publish succeed.
 
 These tests run the real listener on a local TCP port, with a raw store and publisher
-that can be paused or made to fail, and watch what the sender receives.
+that can be paused or made to fail, and watch what the sender receives. Messages the
+listener can't identify get AR, after their bytes are kept as evidence.
 """
 
 import asyncio
@@ -60,6 +61,35 @@ class GatedPublisher:
         return f"{len(self.events)}-0"
 
 
+class EvidenceStore:
+    """Real LocalRawStore for rejected messages, recording what was saved."""
+
+    def __init__(self, root):
+        self.inner = LocalRawStore(root)
+        self.saved = []
+        self.fail = False
+
+    def save_raw(self, raw, meta):
+        if self.fail:
+            raise OSError("disk full")
+        saved = self.inner.save_raw(raw, meta)
+        self.saved.append(saved)
+        return saved
+
+    def load_raw(self, key):
+        return self.inner.load_raw(key)
+
+
+class NoRejectsExpected:
+    """Default rejected-store for tests about valid messages: any reject is a bug."""
+
+    def save_raw(self, raw, meta):
+        raise AssertionError(f"valid message was rejected: {meta.get('header_error')}")
+
+    def load_raw(self, key):
+        raise AssertionError("nothing should be in the rejected area")
+
+
 def frame(payload):
     return b"\x0b" + payload + b"\x1c\r"
 
@@ -76,11 +106,11 @@ async def wait_until(condition, timeout=5.0):
             await asyncio.sleep(0.01)
 
 
-def run_with_listener(store, publisher, body):
+def run_with_listener(store, publisher, body, rejected=None):
     """Start the listener, connect a client, run `body(reader, writer)`, clean up."""
 
     async def main():
-        listener = Listener(store, publisher)
+        listener = Listener(store, publisher, rejected or NoRejectsExpected())
         server = await start_hl7_server(listener.handle_connection, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -109,6 +139,12 @@ def store(tmp_path, order):
 @pytest.fixture
 def publisher(order):
     return GatedPublisher(order)
+
+
+@pytest.fixture
+def rejected(tmp_path_factory):
+    # A separate folder from the raw archive (tmp_path), like data/rejected vs data/raw.
+    return EvidenceStore(tmp_path_factory.mktemp("rejected"))
 
 
 def test_happy_path_order_is_save_publish_ack(store, publisher, order):
@@ -199,18 +235,60 @@ def test_connection_keeps_working_after_an_ae(store, publisher):
     assert len(publisher.events) == 1
 
 
-def test_unreadable_message_is_still_stored_queued_and_acked(store, publisher, tmp_path):
-    junk = b"this is not HL7 \xff\xfe"
+@pytest.mark.parametrize(
+    "junk",
+    [
+        b"this is not HL7 \xff\xfe",
+        b"",
+        b"MSH|^~\\&|SIMHOSP|SYNTH_GENERAL|CDP|CDP|20261120225047||ADT^A01||P|2.5.1\r",
+    ],
+    ids=["not-hl7", "empty-frame", "no-control-id"],
+)
+def test_unidentifiable_message_is_kept_as_evidence_and_rejected(store, publisher, rejected, tmp_path, junk):
+    """No readable MSH, control ID or message type: keep the exact bytes as evidence,
+    never queue them, and reply AR so the sender stops resending."""
 
     async def body(reader, writer):
         writer.write(frame(junk))
         return await asyncio.wait_for(read_frame(reader), 5)
 
+    ack = run_with_listener(store, publisher, body, rejected)
+    assert msa(ack)[1] == "AR"
+    assert msa(ack)[3].startswith("rejected")
+    assert publisher.events == []
+    assert list(tmp_path.rglob("*.hl7")) == []  # nothing in the raw archive
+    [saved] = rejected.saved
+    assert rejected.load_raw(saved.key) == junk
+    assert saved.meta["header_error"]
+
+
+def test_reject_waits_for_the_evidence_to_be_saved(store, publisher, rejected):
+    # We never answer before the bytes are stored, rejections included: if the
+    # evidence can't be saved, reply AE so the sender tries again.
+    rejected.fail = True
+
+    async def body(reader, writer):
+        writer.write(frame(b"not hl7"))
+        return await asyncio.wait_for(read_frame(reader), 5)
+
+    ack = run_with_listener(store, publisher, body, rejected)
+    assert msa(ack)[1] == "AE"
+    assert publisher.events == []
+
+
+def test_byte_order_mark_before_msh_is_accepted_and_stored_exactly(store, publisher):
+    # Some senders prefix a UTF-8 BOM. The header is still readable, so this is a
+    # valid message: AA, queued, and stored with the BOM untouched.
+    msg = b"\xef\xbb\xbf" + MSG
+
+    async def body(reader, writer):
+        writer.write(frame(msg))
+        return await asyncio.wait_for(read_frame(reader), 5)
+
     ack = run_with_listener(store, publisher, body)
-    assert msa(ack)[1] == "AA"
+    assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
     [event] = publisher.events
-    assert event["raw_key"].startswith("hospital=unknown/feed=unknown/")
-    assert store.load_raw(event["raw_key"]) == junk
+    assert store.load_raw(event["raw_key"]) == msg
 
 
 def test_several_messages_on_one_connection_each_get_their_own_ack(store, publisher):

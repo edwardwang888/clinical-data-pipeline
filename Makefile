@@ -6,9 +6,9 @@ export HOST_GID := $(shell id -g)
 
 ## Build and start Redis, the listener, the consumer and the producer.
 up:
-	mkdir -p data/raw
+	mkdir -p data/raw data/rejected
 	docker compose up -d --build
-	@echo "Listener on localhost:2575. Raw files appear under data/raw/. Follow logs: make logs"
+	@echo "Listener on localhost:2575. Raw files appear under data/raw/ (rejected ones under data/rejected/). Follow logs: make logs"
 
 ## Stop everything (the Redis volume and data/raw are kept).
 down:

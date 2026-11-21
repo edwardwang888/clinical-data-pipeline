@@ -35,6 +35,12 @@ def test_tolerates_newline_segment_terminators_and_leading_whitespace():
     assert h.control_id == "CTRL0001"
 
 
+def test_utf8_byte_order_mark_before_msh_is_skipped():
+    h = read_msh(b"\xef\xbb\xbf" + ADT)
+    assert h.error is None
+    assert h.control_id == "CTRL0001"
+
+
 def test_short_header_reads_what_is_there():
     h = read_msh(b"MSH|^~\\&|APP|FAC")
     assert h.facility_id == "FAC"
@@ -84,10 +90,10 @@ def test_ae_ack_carries_text_without_breaking_fields():
     assert msa == b"MSA|AE|CTRL0001|disk full   retry   later"
 
 
-def test_ack_for_unreadable_message_is_still_valid_hl7():
-    ack = build_ack(read_msh(b"not hl7 at all"), "AA", now=NOW, ack_control_id="ACK1")
+def test_reject_for_unreadable_message_is_still_valid_hl7():
+    ack = build_ack(read_msh(b"not hl7 at all"), "AR", text="rejected: no MSH", now=NOW, ack_control_id="ACK1")
     assert ack.startswith(b"MSH|^~\\&|CDP_LISTENER|CDP|||")
-    assert ack.endswith(b"\rMSA|AA|\r")
+    assert ack.endswith(b"\rMSA|AR||rejected: no MSH\r")
 
 
 def test_ack_uses_senders_separators():
