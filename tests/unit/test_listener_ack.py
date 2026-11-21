@@ -7,6 +7,7 @@ listener can't identify get AR, after their bytes are kept as evidence.
 
 import asyncio
 import hashlib
+import logging
 import threading
 
 import pytest
@@ -363,3 +364,92 @@ def test_message_after_an_abandoned_frame_gets_its_own_aa(store, publisher, reje
     [saved] = rejected.saved
     assert rejected.load_raw(saved.key) == before[1:]
     assert saved.meta["header_error"].startswith("abandoned partial frame")
+
+
+# --- nothing is dropped silently ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "before",
+    [b"garbage", b"MSH|no start byte\x1c\r"],
+    ids=["noise-before-frame", "block-without-start-byte"],
+)
+def test_unusable_bytes_are_kept_as_evidence(store, publisher, rejected, before):
+    async def body(reader, writer):
+        writer.write(before + frame(MSG))
+        ack = await asyncio.wait_for(read_frame(reader), 5)
+        with pytest.raises(TimeoutError):  # one reply only: the valid message's
+            await asyncio.wait_for(read_frame(reader), 0.3)
+        return ack
+
+    ack = run_with_listener(store, publisher, body, rejected)
+    assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
+    [event] = publisher.events
+    assert store.load_raw(event["raw_key"]) == MSG
+    [saved] = rejected.saved
+    assert rejected.load_raw(saved.key) == before  # exact bytes as received
+    assert saved.meta["header_error"]  # the reason
+
+
+def test_whitespace_between_frames_is_not_kept(store, publisher, rejected):
+    async def body(reader, writer):
+        writer.write(b"\r\n" + frame(MSG) + b"\r\n" + frame(MSG2))
+        return [await asyncio.wait_for(read_frame(reader), 5) for _ in range(2)]
+
+    acks = run_with_listener(store, publisher, body, rejected)
+    assert [msa(a)[1] for a in acks] == ["AA", "AA"]
+    assert rejected.saved == []
+
+
+def test_frame_cut_off_by_a_disconnect_is_kept_as_evidence(store, publisher, rejected):
+    cut = b"\x0bMSH|^~\\&|SIMHOSP|SYNTH_GENERAL|CDP|CDP|2026"
+
+    async def body(reader, writer):
+        writer.write(frame(MSG) + cut)
+        ack = await asyncio.wait_for(read_frame(reader), 5)
+        writer.close()  # the sender disconnects before finishing the second frame
+        await wait_until(lambda: rejected.saved)
+        return ack
+
+    ack = run_with_listener(store, publisher, body, rejected)
+    assert msa(ack)[1] == "AA"
+    [saved] = rejected.saved
+    assert rejected.load_raw(saved.key) == cut
+    assert "closed mid-frame" in saved.meta["header_error"]
+    assert len(publisher.events) == 1  # only the complete message was queued
+
+
+def test_oversized_frame_is_kept_as_evidence_and_the_connection_closed(store, publisher, rejected):
+    # The test server uses python-hl7's default 64 KiB limit; send more than that.
+    big = MSG + b"NTE|1||" + b"x" * 100_000 + b"\r"
+
+    async def body(reader, writer):
+        writer.write(frame(big))
+        try:
+            reply = await asyncio.wait_for(read_frame(reader), 5)
+        except ConnectionError:
+            reply = None  # closed with unread data: the client sees a reset
+        await wait_until(lambda: rejected.saved)
+        return reply
+
+    assert run_with_listener(store, publisher, body, rejected) is None  # no ACK
+    [saved] = rejected.saved
+    assert rejected.load_raw(saved.key).startswith(b"\x0b" + MSG)
+    assert "size limit" in saved.meta["header_error"]
+    assert publisher.events == []
+
+
+def test_failed_evidence_save_is_still_logged(store, publisher, rejected, caplog):
+    # If even the evidence can't be saved, the log still records it (with its hash),
+    # and the valid message after it is unaffected.
+    rejected.fail = True
+    caplog.set_level(logging.WARNING)
+
+    async def body(reader, writer):
+        writer.write(b"garbage" + frame(MSG))
+        return await asyncio.wait_for(read_frame(reader), 5)
+
+    ack = run_with_listener(store, publisher, body, rejected)
+    assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
+    assert "could not keep" in caplog.text
+    assert hashlib.sha256(b"garbage").hexdigest() in caplog.text

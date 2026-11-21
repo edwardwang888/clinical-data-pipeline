@@ -14,24 +14,31 @@ bytes as evidence in a separate "rejected" store, never queues them, and replies
 ("rejected, don't resend") so the sender's team can investigate. Messages with a
 readable header are always stored and ACKed, however wrong their contents; the parser
 quarantines those later, so problems inside a message never stall the feed.
+
+Nothing is dropped silently. Bytes that aren't part of a usable message (noise before a
+frame, a block with no start byte, a frame cut off by a disconnect or over the size
+limit, an abandoned frame) are kept in the rejected store too, with the reason, and
+logged. If even that save fails, the log line records the bytes' size and sha256.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timezone
 
 from pipeline.publisher import Publisher
 from pipeline.raw_store import RawStore, safe_segment
 from services.listener.ack import build_ack
-from services.listener.framing import FramingError, FrameTooLarge, read_frame, split_abandoned
+from services.listener.framing import read_block, split_abandoned
 from services.listener.msh import MshHeader, read_msh
 
 log = logging.getLogger(__name__)
 
 LISTENER_VERSION = "0.1.0"
 SOURCE_SYSTEM = "hl7v2"
+ABANDONED_FRAME = "abandoned partial frame: the sender started a new frame before finishing this one"
 
 
 class Listener:
@@ -52,22 +59,22 @@ class Listener:
         log.info("connection opened peer=%s", peer)
         try:
             while True:
-                try:
-                    raw = await read_frame(reader)
-                except FrameTooLarge as e:
-                    log.error("closing connection peer=%s: %s", peer, e)
-                    break
-                except FramingError as e:
-                    log.warning("skipping invalid frame peer=%s: %s", peer, e)
-                    continue
-                if raw is None:
+                block = await read_block(reader)
+                if block.discarded:
+                    await self._keep_evidence(block.discarded, block.reason, peer)
+                if block.too_large:
+                    log.error("closing connection peer=%s: %s", peer, block.reason)
+                    break  # can't find the next frame boundary reliably
+                if block.end_of_stream:
                     break  # sender closed the connection
+                if block.payload is None:
+                    continue  # no usable frame (kept above); nothing to answer
 
                 # If the sender abandoned a frame and started a new one, handle the new
                 # message on its own; the abandoned part is kept as evidence, no reply.
-                abandoned, raw = split_abandoned(raw)
+                abandoned, raw = split_abandoned(block.payload)
                 if abandoned:
-                    await self._keep_abandoned(abandoned, peer)
+                    await self._keep_evidence(abandoned, ABANDONED_FRAME, peer)
 
                 ack = await self.handle_message(raw, peer)
                 writer.writeblock(ack)
@@ -140,21 +147,24 @@ class Listener:
         log.warning("rejected (AR) peer=%s reason=%s evidence=%s", peer, header.error, saved.key)
         return build_ack(header, "AR", text=f"rejected: {header.error}")
 
-    async def _keep_abandoned(self, fragment: bytes, peer: str) -> None:
-        """Keep the bytes of a frame the sender abandoned, as evidence. No reply.
+    async def _keep_evidence(self, data: bytes, reason: str, peer: str) -> None:
+        """Keep bytes that aren't a usable message, as evidence, with the reason. No reply.
 
-        The sender never finished this frame, so it isn't waiting for an answer to it,
-        and it will resend the message if it was real. A failure to save the evidence is
-        only logged: it must never hold up the complete message that follows.
+        None of these was a complete frame, so the sender isn't waiting for an answer to
+        it (and resends whatever was real). If saving fails we log the size and sha256,
+        so it's still traceable; it must never hold up the messages around it.
         """
-        meta = _metadata(read_msh(fragment), datetime.now(timezone.utc), peer)
-        meta["header_error"] = "abandoned partial frame: the sender started a new frame before finishing this one"
+        meta = _metadata(read_msh(data), datetime.now(timezone.utc), peer)
+        meta["header_error"] = reason
         try:
-            saved = await asyncio.to_thread(self.rejected_store.save_raw, fragment, meta)
+            saved = await asyncio.to_thread(self.rejected_store.save_raw, data, meta)
         except Exception:
-            log.exception("could not keep abandoned frame peer=%s (%d bytes)", peer, len(fragment))
+            log.exception(
+                "could not keep evidence peer=%s reason=%s bytes=%d sha256=%s",
+                peer, reason, len(data), hashlib.sha256(data).hexdigest(),
+            )
             return
-        log.warning("abandoned partial frame peer=%s bytes=%d evidence=%s", peer, len(fragment), saved.key)
+        log.warning("kept unusable bytes peer=%s reason=%s bytes=%d evidence=%s", peer, reason, len(data), saved.key)
 
     async def close_connections(self) -> None:
         """Stop serving open connections (used on shutdown). In-flight messages that

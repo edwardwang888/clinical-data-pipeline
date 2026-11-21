@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from services.listener.framing import FramingError, FrameTooLarge, read_frame, split_abandoned
+from services.listener.framing import FramingError, FrameTooLarge, read_block, read_frame, split_abandoned
 
 VT, FS_CR = b"\x0b", b"\x1c\r"
 # Segments end in \r; \xe9 is not valid UTF-8. Both must come through unchanged.
@@ -168,3 +168,62 @@ def test_python_hl7_writer_frames_payload():
 @pytest.mark.parametrize("noise", [b"\r\n", b"   ", b"\x00\x00"])
 def test_any_noise_before_start_byte_is_dropped(noise):
     assert read_all([noise + frame(MSG_A)]) == [MSG_A, None]
+
+
+# --- read_block: nothing is dropped silently -----------------------------------------
+
+
+def blocks(chunks: list[bytes], limit: int = 2**16, n: int = 1):
+    """Feed `chunks` (then EOF) and return the next `n` results of read_block."""
+
+    async def run():
+        reader = asyncio.StreamReader(limit=limit)
+        for chunk in chunks:
+            reader.feed_data(chunk)
+        reader.feed_eof()
+        return [await read_block(reader) for _ in range(n)]
+
+    return asyncio.run(run())
+
+
+def test_block_reports_noise_before_the_frame():
+    [b] = blocks([b"garbage" + frame(MSG_A)])
+    assert b.payload == MSG_A
+    assert b.discarded == b"garbage"
+    assert "before the frame start" in b.reason
+
+
+def test_block_ignores_whitespace_between_frames():
+    # A newline after each frame is common and harmless: not bad data, nothing to keep.
+    [b] = blocks([b"\r\n" + frame(MSG_A)])
+    assert (b.payload, b.discarded) == (MSG_A, b"")
+
+
+def test_block_without_start_byte_is_handed_back_whole():
+    data = b"MSH|no start byte" + FS_CR
+    first, second = blocks([data + frame(MSG_A)], n=2)
+    assert first.payload is None
+    assert first.discarded == data  # exact bytes as received, end marker included
+    assert "no <VT>" in first.reason
+    assert second.payload == MSG_A  # and the stream is still in sync
+
+
+def test_block_cut_off_by_disconnect_is_handed_back():
+    cut = VT + b"MSH|cut off"
+    [b] = blocks([cut])
+    assert b.payload is None and b.end_of_stream
+    assert b.discarded == cut
+    assert "closed mid-frame" in b.reason
+
+
+def test_clean_disconnect_has_nothing_to_keep():
+    for tail in (b"", b"\r\n"):
+        [b] = blocks([tail])
+        assert (b.payload, b.discarded, b.end_of_stream) == (None, b"", True)
+
+
+def test_oversized_frame_hands_back_what_was_received():
+    [b] = blocks([VT + b"x" * 500 + FS_CR], limit=100)
+    assert b.payload is None and b.too_large
+    assert b.discarded.startswith(VT + b"xxx")
+    assert "size limit" in b.reason

@@ -1,10 +1,11 @@
 """MLLP framing: each message travels as  <VT> payload <FS><CR>  (0x0B ... 0x1C 0x0D).
 
 python-hl7 provides the asyncio server and stream classes (`hl7.mllp`). We read frames
-with our own small `read_frame` instead of its `readblock()`, for one reason:
-`readblock()` raises and throws the whole frame away if *any* byte arrives before the
-<VT>. Some senders put a newline between frames, and we must not drop a message (and
-leave the sender waiting for an ACK) over a stray newline.
+with our own small `read_block` / `read_frame` instead of its `readblock()`, for two
+reasons. `readblock()` raises and throws the whole frame away if *any* byte arrives
+before the <VT>, and some senders put a newline between frames. And we never drop bytes
+silently: anything that isn't part of a usable frame is handed back to the listener,
+which keeps it as evidence with the reason.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
@@ -32,37 +34,68 @@ class FrameTooLarge(FramingError):
     connection must be closed."""
 
 
-async def read_frame(reader: asyncio.StreamReader) -> bytes | None:
-    """Read the next frame and return its payload as the exact bytes received.
+@dataclass(frozen=True)
+class Block:
+    """What `read_block` found next in the stream.
 
-    Returns None when the connection ends (cleanly, or in the middle of a frame that
-    was never completed, which we never ACKed, so the sender will resend it).
-
-    Raises `FramingError` for a block that has an end marker but no start marker (the
-    stream is still in sync, so the caller can keep reading), and `FrameTooLarge` when
-    a frame exceeds the reader's limit.
+    `payload` is a complete frame's content, or None if there isn't one. `discarded`
+    holds any bytes that aren't part of a usable frame (exactly as received), and
+    `reason` says why; the listener keeps those as evidence, so nothing is dropped
+    silently. Whitespace between frames is not reported: it's common and harmless.
     """
+
+    payload: bytes | None
+    discarded: bytes = b""
+    reason: str = ""
+    end_of_stream: bool = False  # the connection ended
+    too_large: bool = False  # a frame exceeded the size limit: close the connection
+
+
+async def read_block(reader: asyncio.StreamReader) -> Block:
+    """Read up to the next end marker and return the frame, plus anything unusable."""
     try:
         block = await reader.readuntil(END_BLOCK)
     except asyncio.IncompleteReadError as e:
-        if e.partial.strip():
-            log.warning("connection closed mid-frame; dropped %d incomplete bytes", len(e.partial))
-        return None
+        # The connection ended. Leftover bytes are a frame that was never completed (so
+        # never ACKed; the sender resends it if it was real).
+        leftover = e.partial if e.partial.strip() else b""
+        return Block(None, leftover, "connection closed mid-frame" if leftover else "", end_of_stream=True)
     except asyncio.LimitOverrunError as e:
-        raise FrameTooLarge(f"frame larger than the {e.consumed}+ byte limit") from e
+        # The frame is too big to buffer. Hand back what was received so far (it stays in
+        # the reader's buffer after the error); the connection can't be resynced.
+        head = await reader.read(max(e.consumed, 1))
+        reason = f"frame exceeded the size limit; first {len(head)} bytes kept"
+        return Block(None, head, reason, too_large=True)
 
     # The frame starts at the *first* <VT>; only bytes before it are noise. A later
     # <VT> stays in the payload: it may be a stray byte inside the message, or an
-    # abandoned partial frame followed by a new one. Either way we keep every byte,
-    # because cutting there would store a fragment and still ACK it as the message.
+    # abandoned partial frame followed by a new one (see split_abandoned). Either way
+    # we keep every byte, because cutting there would store a fragment and ACK it.
     start = block.find(START_BLOCK)
     if start == -1:
-        raise FramingError(f"{len(block)} bytes ended with <FS><CR> but had no <VT> start byte")
-    if start > 0:
-        noise = block[:start]
-        level = logging.DEBUG if not noise.strip() else logging.WARNING
-        log.log(level, "skipped %d bytes before the frame start: %r", len(noise), noise[:40])
-    return block[start + 1 : -len(END_BLOCK)]
+        return Block(None, block, "block ended with <FS><CR> but had no <VT> start byte")
+    noise = block[:start]
+    if noise.strip():
+        return Block(block[start + 1 : -len(END_BLOCK)], noise, "bytes before the frame start")
+    return Block(block[start + 1 : -len(END_BLOCK)])
+
+
+async def read_frame(reader: asyncio.StreamReader) -> bytes | None:
+    """Read the next frame and return just its payload, as the exact bytes received.
+
+    A simpler view of `read_block` for code that only wants frames (e.g. a client
+    reading ACKs). Returns None when the connection ends. Raises `FramingError` for a
+    block with no <VT> (the stream stays in sync, so the caller can keep reading) and
+    `FrameTooLarge` when a frame exceeds the reader's limit. Discarded bytes are logged.
+    """
+    block = await read_block(reader)
+    if block.discarded:
+        log.warning("%s: %d bytes not used as a frame", block.reason, len(block.discarded))
+    if block.too_large:
+        raise FrameTooLarge(block.reason)
+    if block.payload is None and not block.end_of_stream:
+        raise FramingError(block.reason)
+    return block.payload
 
 
 def split_abandoned(payload: bytes) -> tuple[bytes, bytes]:
