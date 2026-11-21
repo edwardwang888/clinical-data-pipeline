@@ -110,7 +110,6 @@ class RawEventConsumer:
         should_stop: Callable[[], bool] = lambda: False,
         retry_delay: float = 0.5,
         max_retry_delay: float = 10.0,
-        sleep: Callable[[float], None] | None = None,
     ) -> None:
         """Process events until `should_stop()` returns True.
 
@@ -119,7 +118,6 @@ class RawEventConsumer:
         our own pending events: anything we received but hadn't XACKed when Redis went
         away is still waiting for us.
         """
-        sleep = sleep or (lambda seconds: _wait(seconds, should_stop))
         delay = retry_delay
         connected = False
         while not should_stop():
@@ -135,7 +133,7 @@ class RawEventConsumer:
                 # (redis-py's "still loading the dataset" error is a ConnectionError too.)
                 log.warning("Redis unavailable (%s); retrying in %.1fs", e, delay)
                 connected = False
-                sleep(delay)
+                _wait(delay, should_stop)
                 delay = min(delay * 2, max_retry_delay)
 
     def _read(self, start_id: str, block_ms: int | None) -> list[tuple[str, dict | None]]:

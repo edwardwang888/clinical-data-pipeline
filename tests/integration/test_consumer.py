@@ -3,6 +3,7 @@ crash, and claiming events a dead consumer left behind."""
 
 import signal
 import time
+from unittest import mock
 
 import pytest
 import redis
@@ -126,7 +127,7 @@ class FlakyClient:
 
 def test_consumer_waits_out_a_redis_outage_instead_of_crashing(redis_client, stream_name):
     publish(redis_client, stream_name, 3)
-    seen, waits = [], []
+    seen = []
     consumer = RawEventConsumer(
         FlakyClient(redis_client, failures=3),
         stream_name,
@@ -134,8 +135,11 @@ def test_consumer_waits_out_a_redis_outage_instead_of_crashing(redis_client, str
         handler=lambda i, f: seen.append(f["control_id"]),
     )
 
-    consumer.run_forever(block_ms=100, should_stop=lambda: len(seen) == 3, sleep=waits.append)
+    # Patch out the real waiting (it would take 3.5 s) and record the delays instead.
+    with mock.patch("pipeline.consumer._wait") as wait:
+        consumer.run_forever(block_ms=100, should_stop=lambda: len(seen) == 3)
 
+    waits = [c.args[0] for c in wait.call_args_list]
     assert waits == [0.5, 1.0, 2.0]  # waited longer each time Redis was unreachable
     assert seen == ["C0", "C1", "C2"]
     assert pending_count(redis_client, stream_name) == 0
@@ -154,7 +158,8 @@ def test_consumer_rereads_its_pending_events_after_reconnecting(redis_client, st
         consumer="c1",
         handler=lambda i, f: seen.append(f["control_id"]),
     )
-    consumer.run_forever(block_ms=100, should_stop=lambda: len(seen) == 1, sleep=lambda s: None)
+    with mock.patch("pipeline.consumer._wait"):  # no real waiting between reconnects
+        consumer.run_forever(block_ms=100, should_stop=lambda: len(seen) == 1)
 
     assert seen == ["C0"]
     assert pending_count(redis_client, stream_name) == 0
