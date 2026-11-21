@@ -6,11 +6,10 @@ import asyncio
 import hashlib
 
 import pytest
+from hl7.mllp import open_hl7_connection
 
 from pipeline.raw_store import LocalRawStore
-from services.listener.framing import read_frame
-from tests.conftest import free_port
-from tests.integration.test_listener_restart import ListenerProcess
+from tests.conftest import ListenerProcess, free_port
 
 pytestmark = pytest.mark.integration
 
@@ -21,12 +20,12 @@ def send(port, data):
     """Send raw bytes on one connection and return the replies until it goes quiet."""
 
     async def run():
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        reader, writer = await open_hl7_connection("127.0.0.1", port)
         writer.write(data)
         replies = []
         try:
             while True:
-                replies.append(await asyncio.wait_for(read_frame(reader), 1.0))
+                replies.append(await asyncio.wait_for(reader.readblock(), 1.0))
         except TimeoutError:
             pass
         writer.close()
@@ -38,7 +37,7 @@ def send(port, data):
 def test_bad_input_is_dead_lettered_with_its_evidence(tmp_path, redis_url, redis_client, stream_name):
     dlq_stream = f"{stream_name}.dlq"
     port = free_port()
-    listener = ListenerProcess(port, tmp_path / "raw", redis_url, stream_name, tmp_path / "listener.log")
+    listener = ListenerProcess(port, tmp_path, redis_url, stream_name)
     listener.start()
     try:
         # Noise, then an unidentifiable frame, then a valid message, on one connection.
@@ -53,7 +52,7 @@ def test_bad_input_is_dead_lettered_with_its_evidence(tmp_path, redis_url, redis
     assert codes == [b"AR", b"AA"]
 
     # One DLQ entry per bad input, each pointing at its exact bytes in data/rejected.
-    evidence = LocalRawStore(tmp_path / "rejected")
+    evidence = LocalRawStore(listener.rejected_dir)
     by_kind = {e["kind"]: e for e in entries}
     assert set(by_kind) == {"noise_before_frame", "unidentifiable"}
     assert by_kind["noise_before_frame"]["reply"] == "none"
@@ -67,4 +66,4 @@ def test_bad_input_is_dead_lettered_with_its_evidence(tmp_path, redis_url, redis
 
     # The valid message went to the raw archive and the normal stream, not the DLQ.
     assert redis_client.xlen(stream_name) == 1
-    assert len(list((tmp_path / "raw").rglob("*.hl7"))) == 1
+    assert len(list(listener.raw_dir.rglob("*.hl7"))) == 1

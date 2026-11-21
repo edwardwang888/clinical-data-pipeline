@@ -13,21 +13,20 @@ import tempfile
 import threading
 
 import pytest
-from hl7.mllp import start_hl7_server
+from hl7.mllp import open_hl7_connection, start_hl7_server
 
 from pipeline.raw_store import LocalRawStore
-from services.listener.framing import read_frame
 from services.listener.server import Listener
 
 MSG = b"MSH|^~\\&|SIMHOSP|SYNTH_GENERAL|CDP|CDP|20261120225047||ADT^A01|CTRL0001|P|2.5.1\rPID|||SYN000001\r"
 MSG2 = MSG.replace(b"CTRL0001", b"CTRL0002")
 
 
-class GatedStore:
+class GatedStore(LocalRawStore):
     """Real LocalRawStore, but each save can be paused (gate) or made to fail."""
 
     def __init__(self, root, order):
-        self.inner = LocalRawStore(root)
+        super().__init__(root)
         self.order = order
         self.gate = threading.Event()
         self.gate.set()
@@ -38,12 +37,9 @@ class GatedStore:
         self.gate.wait(10)
         if self.fail:
             raise OSError("disk full")
-        saved = self.inner.save_raw(raw, meta)
+        saved = super().save_raw(raw, meta)
         self.order.append("save:done")
         return saved
-
-    def load_raw(self, key):
-        return self.inner.load_raw(key)
 
 
 class GatedPublisher:
@@ -64,23 +60,20 @@ class GatedPublisher:
         return f"{len(self.events)}-0"
 
 
-class EvidenceStore:
+class EvidenceStore(LocalRawStore):
     """Real LocalRawStore for rejected messages, recording what was saved."""
 
     def __init__(self, root):
-        self.inner = LocalRawStore(root)
+        super().__init__(root)
         self.saved = []
         self.fail = False
 
     def save_raw(self, raw, meta):
         if self.fail:
             raise OSError("disk full")
-        saved = self.inner.save_raw(raw, meta)
+        saved = super().save_raw(raw, meta)
         self.saved.append(saved)
         return saved
-
-    def load_raw(self, key):
-        return self.inner.load_raw(key)
 
 
 class DeadLetters:
@@ -113,6 +106,16 @@ async def wait_until(condition, timeout=5.0):
             await asyncio.sleep(0.01)
 
 
+async def read_reply(reader, timeout=5.0):
+    """The listener's next reply (an ACK), without its MLLP framing."""
+    return await asyncio.wait_for(reader.readblock(), timeout)
+
+
+async def assert_no_reply(reader):
+    with pytest.raises(TimeoutError):
+        await read_reply(reader, timeout=0.3)
+
+
 def run_with_listener(store, publisher, body, rejected=None, dlq=None):
     """Start the listener, connect a client, run `body(reader, writer)`, clean up.
 
@@ -127,7 +130,7 @@ def run_with_listener(store, publisher, body, rejected=None, dlq=None):
         listener = Listener(store, publisher, rejected, dlq)
         server = await start_hl7_server(listener.handle_connection, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        reader, writer = await open_hl7_connection("127.0.0.1", port)
         try:
             return await body(reader, writer)
         finally:
@@ -142,6 +145,16 @@ def run_with_listener(store, publisher, body, rejected=None, dlq=None):
         assert rejected.saved == [], "a valid message was rejected or treated as bad input"
         assert dlq.entries == [], "a valid message reached the dead-letter queue"
     return result
+
+
+def send(store, publisher, data, rejected=None, dlq=None):
+    """Send `data` on one connection and return the listener's reply."""
+
+    async def body(reader, writer):
+        writer.write(data)
+        return await read_reply(reader)
+
+    return run_with_listener(store, publisher, body, rejected, dlq)
 
 
 @pytest.fixture
@@ -185,7 +198,7 @@ def assert_dead_letter(entry, saved, data, kind, reply):
 def test_happy_path_order_is_save_publish_ack(store, publisher, order):
     async def body(reader, writer):
         writer.write(frame(MSG))
-        ack = await asyncio.wait_for(read_frame(reader), 5)
+        ack = await read_reply(reader)
         order.append("ack:received")
         return ack
 
@@ -200,12 +213,11 @@ def test_no_ack_while_save_is_in_progress(store, publisher, order):
     async def body(reader, writer):
         writer.write(frame(MSG))
         await wait_until(lambda: "save:start" in order)
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(read_frame(reader), 0.3)
+        await assert_no_reply(reader)
         assert "publish:start" not in order  # never publish before the save is done
 
         store.gate.set()
-        return await asyncio.wait_for(read_frame(reader), 5)
+        return await read_reply(reader)
 
     assert msa(run_with_listener(store, publisher, body))[1] == "AA"
 
@@ -218,11 +230,10 @@ def test_no_ack_while_publish_is_in_progress(store, publisher, order, tmp_path):
         await wait_until(lambda: "publish:start" in order)
         # The raw file is already on disk, but that alone is not enough to ACK.
         assert len(list(tmp_path.rglob("*.hl7"))) == 1
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(read_frame(reader), 0.3)
+        await assert_no_reply(reader)
 
         publisher.gate.set()
-        return await asyncio.wait_for(read_frame(reader), 5)
+        return await read_reply(reader)
 
     assert msa(run_with_listener(store, publisher, body))[1] == "AA"
 
@@ -230,11 +241,7 @@ def test_no_ack_while_publish_is_in_progress(store, publisher, order, tmp_path):
 def test_save_failure_sends_ae_and_publishes_nothing(store, publisher, order):
     store.fail = True
 
-    async def body(reader, writer):
-        writer.write(frame(MSG))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    ack = run_with_listener(store, publisher, body)
+    ack = send(store, publisher, frame(MSG))
     assert msa(ack)[:3] == ["MSA", "AE", "CTRL0001"]
     assert publisher.events == []
     assert "publish:start" not in order
@@ -243,11 +250,7 @@ def test_save_failure_sends_ae_and_publishes_nothing(store, publisher, order):
 def test_publish_failure_sends_ae(store, publisher, tmp_path):
     publisher.fail = True
 
-    async def body(reader, writer):
-        writer.write(frame(MSG))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    ack = run_with_listener(store, publisher, body)
+    ack = send(store, publisher, frame(MSG))
     assert msa(ack)[1] == "AE"
     # The raw file was saved; it's the queueing that failed, and the text says so.
     assert msa(ack)[3] == "message not queued; please resend"
@@ -261,10 +264,10 @@ def test_connection_keeps_working_after_an_ae(store, publisher):
 
     async def body(reader, writer):
         writer.write(frame(MSG))
-        first = await asyncio.wait_for(read_frame(reader), 5)
+        first = await read_reply(reader)
         publisher.fail = False
         writer.write(frame(MSG))  # the sender resends the same message
-        second = await asyncio.wait_for(read_frame(reader), 5)
+        second = await read_reply(reader)
         return first, second
 
     first, second = run_with_listener(store, publisher, body)
@@ -285,12 +288,7 @@ def test_unidentifiable_message_is_kept_as_evidence_and_rejected(store, publishe
     """No readable MSH, control ID or message type: keep the exact bytes as evidence,
     record it in the dead-letter queue, never queue it for processing, and reply AR so
     the sender stops resending."""
-
-    async def body(reader, writer):
-        writer.write(frame(junk))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    ack = run_with_listener(store, publisher, body, rejected, dlq)
+    ack = send(store, publisher, frame(junk), rejected, dlq)
     assert msa(ack)[1] == "AR"
     assert msa(ack)[3].startswith("rejected")
     assert publisher.events == []
@@ -301,16 +299,12 @@ def test_unidentifiable_message_is_kept_as_evidence_and_rejected(store, publishe
     assert_dead_letter(entry, saved, junk, kind="unidentifiable", reply="AR")
 
 
-def test_reject_waits_for_the_evidence_to_be_saved(store, publisher, rejected):
+def test_reject_waits_for_the_evidence_to_be_saved(store, publisher, rejected, dlq):
     # We never answer before the bytes are stored, rejections included: if the
     # evidence can't be saved, reply AE so the sender tries again.
     rejected.fail = True
 
-    async def body(reader, writer):
-        writer.write(frame(b"not hl7"))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    ack = run_with_listener(store, publisher, body, rejected, DeadLetters())
+    ack = send(store, publisher, frame(b"not hl7"), rejected, dlq)
     assert msa(ack)[1] == "AE"
     assert publisher.events == []
 
@@ -320,11 +314,7 @@ def test_reject_waits_for_the_dead_letter_entry(store, publisher, rejected, dlq)
     # DLQ is down, reply AE so the sender tries again.
     dlq.fail = True
 
-    async def body(reader, writer):
-        writer.write(frame(b"not hl7"))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    ack = run_with_listener(store, publisher, body, rejected, dlq)
+    ack = send(store, publisher, frame(b"not hl7"), rejected, dlq)
     assert msa(ack)[1] == "AE"
 
 
@@ -333,11 +323,7 @@ def test_byte_order_mark_before_msh_is_accepted_and_stored_exactly(store, publis
     # valid message: AA, queued, and stored with the BOM untouched.
     msg = b"\xef\xbb\xbf" + MSG
 
-    async def body(reader, writer):
-        writer.write(frame(msg))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    ack = run_with_listener(store, publisher, body)
+    ack = send(store, publisher, frame(msg))
     assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
     [event] = publisher.events
     assert store.load_raw(event["raw_key"]) == msg
@@ -347,18 +333,14 @@ def test_several_messages_on_one_connection_each_get_their_own_ack(store, publis
     async def body(reader, writer):
         # Both frames in one write, with a stray newline between them.
         writer.write(frame(MSG) + b"\n" + frame(MSG2))
-        return [await asyncio.wait_for(read_frame(reader), 5) for _ in range(2)]
+        return [await read_reply(reader) for _ in range(2)]
 
     acks = run_with_listener(store, publisher, body)
     assert [msa(a)[2] for a in acks] == ["CTRL0001", "CTRL0002"]
 
 
 def test_event_points_at_the_exact_raw_bytes(store, publisher):
-    async def body(reader, writer):
-        writer.write(frame(MSG))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    run_with_listener(store, publisher, body)
+    send(store, publisher, frame(MSG))
     [event] = publisher.events
     assert store.load_raw(event["raw_key"]) == MSG
     assert event["raw_message_id"] == hashlib.sha256(MSG).hexdigest()
@@ -374,11 +356,7 @@ def test_vt_byte_inside_a_message_is_stored_whole_and_acked_correctly(store, pub
     the bytes after it were stored, and the AA had an empty control ID."""
     msg = MSG + b"OBX|1|TX|NOTE||line one\x0bline two\r"
 
-    async def body(reader, writer):
-        writer.write(frame(msg))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    ack = run_with_listener(store, publisher, body)
+    ack = send(store, publisher, frame(msg))
     assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
     [event] = publisher.events
     assert store.load_raw(event["raw_key"]) == msg
@@ -401,10 +379,9 @@ def test_message_after_an_abandoned_frame_gets_its_own_aa(store, publisher, reje
 
     async def body(reader, writer):
         writer.write(before + frame(MSG))
-        ack = await asyncio.wait_for(read_frame(reader), 5)
+        ack = await read_reply(reader)
         # Only one reply: the abandoned fragment was never completed, so it gets none.
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(read_frame(reader), 0.3)
+        await assert_no_reply(reader)
         return ack
 
     ack = run_with_listener(store, publisher, body, rejected, dlq)
@@ -429,9 +406,8 @@ def test_message_after_an_abandoned_frame_gets_its_own_aa(store, publisher, reje
 def test_unusable_bytes_are_kept_as_evidence(store, publisher, rejected, dlq, before, kind):
     async def body(reader, writer):
         writer.write(before + frame(MSG))
-        ack = await asyncio.wait_for(read_frame(reader), 5)
-        with pytest.raises(TimeoutError):  # one reply only: the valid message's
-            await asyncio.wait_for(read_frame(reader), 0.3)
+        ack = await read_reply(reader)
+        await assert_no_reply(reader)  # one reply only: the valid message's
         return ack
 
     ack = run_with_listener(store, publisher, body, rejected, dlq)
@@ -447,7 +423,7 @@ def test_unusable_bytes_are_kept_as_evidence(store, publisher, rejected, dlq, be
 def test_whitespace_between_frames_is_not_kept(store, publisher, rejected, dlq):
     async def body(reader, writer):
         writer.write(b"\r\n" + frame(MSG) + b"\r\n" + frame(MSG2))
-        return [await asyncio.wait_for(read_frame(reader), 5) for _ in range(2)]
+        return [await read_reply(reader) for _ in range(2)]
 
     acks = run_with_listener(store, publisher, body, rejected, dlq)
     assert [msa(a)[1] for a in acks] == ["AA", "AA"]
@@ -460,7 +436,7 @@ def test_frame_cut_off_by_a_disconnect_is_kept_as_evidence(store, publisher, rej
 
     async def body(reader, writer):
         writer.write(frame(MSG) + cut)
-        ack = await asyncio.wait_for(read_frame(reader), 5)
+        ack = await read_reply(reader)
         writer.close()  # the sender disconnects before finishing the second frame
         await wait_until(lambda: dlq.entries)
         return ack
@@ -481,9 +457,9 @@ def test_oversized_frame_is_kept_as_evidence_and_the_connection_closed(store, pu
     async def body(reader, writer):
         writer.write(frame(big))
         try:
-            reply = await asyncio.wait_for(read_frame(reader), 5)
-        except ConnectionError:
-            reply = None  # closed with unread data: the client sees a reset
+            reply = await read_reply(reader)
+        except (ConnectionError, asyncio.IncompleteReadError):
+            reply = None  # the listener closed the connection without replying
         await wait_until(lambda: dlq.entries)
         return reply
 
@@ -501,11 +477,7 @@ def test_failed_evidence_save_puts_the_bytes_in_the_dead_letter_entry(store, pub
     # and the valid message after them is unaffected.
     rejected.fail = True
 
-    async def body(reader, writer):
-        writer.write(b"garbage" + frame(MSG))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    ack = run_with_listener(store, publisher, body, rejected, dlq)
+    ack = send(store, publisher, b"garbage" + frame(MSG), rejected, dlq)
     assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
     [entry] = dlq.entries
     assert entry["evidence_key"] == ""
@@ -519,11 +491,7 @@ def test_dead_letter_queue_down_falls_back_to_the_log(store, publisher, rejected
     dlq.fail = True
     caplog.set_level(logging.ERROR)
 
-    async def body(reader, writer):
-        writer.write(b"garbage" + frame(MSG))
-        return await asyncio.wait_for(read_frame(reader), 5)
-
-    ack = run_with_listener(store, publisher, body, rejected, dlq)
+    ack = send(store, publisher, b"garbage" + frame(MSG), rejected, dlq)
     assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
     [saved] = rejected.saved
     assert hashlib.sha256(b"garbage").hexdigest() in caplog.text

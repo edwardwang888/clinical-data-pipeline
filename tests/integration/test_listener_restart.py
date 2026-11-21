@@ -11,84 +11,30 @@ queue event pointing at such a file. Duplicates are fine; losses are not.
 import asyncio
 import hashlib
 import json
-import os
 import signal
-import socket
-import subprocess
-import sys
-import time
 from collections import defaultdict
-from pathlib import Path
 
 import pytest
 
 from pipeline.raw_store import LocalRawStore
 from producer.messages import MessageGenerator
 from producer.sender import MllpSender
-from tests.conftest import free_port
+from tests.conftest import ListenerProcess, free_port
 
 pytestmark = pytest.mark.integration
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 N_MESSAGES = 1000
 N_CONNECTIONS = 4
 RESTART_AFTER_ACKS = 400
-
-
-class ListenerProcess:
-    """The real listener (`python -m services.listener`) as a child process."""
-
-    def __init__(self, port, raw_dir, redis_url, stream, log_path):
-        self.port = port
-        self.log_path = log_path
-        self.env = {
-            **os.environ,
-            "LISTENER_HOST": "127.0.0.1",
-            "LISTENER_PORT": str(port),
-            "RAW_DIR": str(raw_dir),
-            "RAW_REJECTED_DIR": str(raw_dir.parent / "rejected"),
-            "REDIS_URL": redis_url,
-            "RAW_STREAM": stream,
-            "DLQ_STREAM": f"{stream}.dlq",
-            "LOG_LEVEL": "WARNING",
-        }
-        self.proc = None
-        self.starts = 0
-
-    def start(self):
-        log = open(self.log_path, "a")
-        self.proc = subprocess.Popen(
-            [sys.executable, "-m", "services.listener"],
-            cwd=REPO_ROOT,
-            env=self.env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
-        self.starts += 1
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"listener exited early:\n{self.log_path.read_text()}")
-            try:
-                socket.create_connection(("127.0.0.1", self.port), timeout=0.2).close()
-                return
-            except OSError:
-                time.sleep(0.05)
-        raise RuntimeError("listener did not start listening in time")
-
-    def stop(self, sig=signal.SIGTERM):
-        if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(sig)
-            self.proc.wait(timeout=15)
 
 
 @pytest.mark.parametrize("sig", [signal.SIGKILL, signal.SIGTERM], ids=["crash", "clean-stop"])
 def test_no_acked_message_is_lost_when_listener_restarts(
     tmp_path, redis_url, redis_client, stream_name, sig
 ):
-    raw_dir = tmp_path / "raw"
     port = free_port()
-    listener = ListenerProcess(port, raw_dir, redis_url, stream_name, tmp_path / "listener.log")
+    listener = ListenerProcess(port, tmp_path, redis_url, stream_name)
+    raw_dir = listener.raw_dir
     messages = MessageGenerator(seed=2026, run_id="IT").take(N_MESSAGES)
     sent_bytes = {m.raw for m in messages}
     acked: dict[str, bytes] = {}  # control_id -> exact bytes, recorded only on AA
@@ -134,7 +80,7 @@ def test_no_acked_message_is_lost_when_listener_restarts(
     # No truncated or foreign file ever appears under a final name: every .hl7 file
     # holds exactly the bytes of a message we sent. (A crash can leave .tmp-* files.)
     hl7_files = list(raw_dir.rglob("*.hl7"))
-    assert not (tmp_path / "rejected").exists()  # every message was valid: none rejected
+    assert not listener.rejected_dir.exists()  # every message was valid: none rejected
     assert redis_client.xlen(f"{stream_name}.dlq") == 0  # and nothing was dead-lettered
     assert all(p.read_bytes() in sent_bytes for p in hl7_files)
 

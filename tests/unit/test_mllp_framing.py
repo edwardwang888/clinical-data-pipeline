@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from services.listener.framing import FramingError, FrameTooLarge, read_block, read_frame, split_abandoned
+from services.listener.framing import read_block, split_abandoned
 
 VT, FS_CR = b"\x0b", b"\x1c\r"
 # Segments end in \r; \xe9 is not valid UTF-8. Both must come through unchanged.
@@ -14,59 +14,57 @@ def frame(payload: bytes) -> bytes:
     return VT + payload + FS_CR
 
 
-def read_all(chunks: list[bytes], limit: int = 2**16) -> list[bytes | None | Exception]:
-    """Feed `chunks` into a stream (then EOF) and read frames until the stream ends."""
+def read_blocks(chunks: list[bytes], limit: int = 2**16) -> list:
+    """Feed `chunks` into a stream (then EOF) and return every Block until the stream ends."""
 
     async def run():
         reader = asyncio.StreamReader(limit=limit)
         for chunk in chunks:
             reader.feed_data(chunk)
         reader.feed_eof()
-        results = []
+        found = []
         while True:
-            try:
-                payload = await read_frame(reader)
-            except FrameTooLarge as e:
-                results.append(e)
-                return results
-            except FramingError as e:
-                results.append(e)
-                continue
-            results.append(payload)
-            if payload is None:
-                return results
+            block = await read_block(reader)
+            found.append(block)
+            if block.end_of_stream or block.too_large:
+                return found
 
     return asyncio.run(run())
 
 
+def payloads(chunks: list[bytes]) -> list[bytes]:
+    """Just the complete frames' payloads, as the listener would process them."""
+    return [b.payload for b in read_blocks(chunks) if b.payload is not None]
+
+
 def test_single_frame_returns_exact_payload():
-    assert read_all([frame(MSG_A)]) == [MSG_A, None]
+    assert payloads([frame(MSG_A)]) == [MSG_A]
 
 
 def test_two_frames_in_one_chunk():
-    assert read_all([frame(MSG_A) + frame(MSG_B)]) == [MSG_A, MSG_B, None]
+    assert payloads([frame(MSG_A) + frame(MSG_B)]) == [MSG_A, MSG_B]
 
 
 def test_frame_split_into_one_byte_chunks():
     data = frame(MSG_A) + frame(MSG_B)
-    assert read_all([data[i : i + 1] for i in range(len(data))]) == [MSG_A, MSG_B, None]
+    assert payloads([data[i : i + 1] for i in range(len(data))]) == [MSG_A, MSG_B]
 
 
 def test_end_marker_split_across_chunks():
     data = frame(MSG_A)
-    assert read_all([data[:-1], data[-1:]]) == [MSG_A, None]
+    assert payloads([data[:-1], data[-1:]]) == [MSG_A]
 
 
 def test_payload_containing_lone_fs_byte_is_not_cut_short():
     # 0x1C alone is not the end marker; only 0x1C followed by 0x0D is.
     payload = b"MSH|^~\\&|X\rNTE|1||a\x1cb\r"
-    assert read_all([frame(payload)]) == [payload, None]
+    assert payloads([frame(payload)]) == [payload]
 
 
 def test_newline_between_frames_is_tolerated():
     # Some senders write "\n" after each frame. python-hl7's readblock() would drop
     # the next message; we must not.
-    assert read_all([frame(MSG_A) + b"\n" + frame(MSG_B) + b"\n"]) == [MSG_A, MSG_B, None]
+    assert payloads([frame(MSG_A) + b"\n" + frame(MSG_B) + b"\n"]) == [MSG_A, MSG_B]
 
 
 def test_vt_byte_inside_payload_is_kept():
@@ -74,15 +72,15 @@ def test_vt_byte_inside_payload_is_kept():
     # character in free text) we must keep every byte. Cutting at that <VT> would
     # store only the tail and still ACK it.
     payload = b"MSH|^~\\&|A|SYNTH_GENERAL|||20261120||ORU^R01|C1|P|2.5.1\rOBX|1|TX|NOTE||line one\x0bline two\r"
-    assert read_all([frame(payload)]) == [payload, None]
+    assert payloads([frame(payload)]) == [payload]
 
 
 def test_abandoned_partial_frame_is_kept_with_the_next_frame():
     # The sender started a frame, gave up without an end marker, then sent a full one.
-    # Both land in one block, and read_frame keeps every byte of it. The listener then
+    # Both land in one block, and read_block keeps every byte of it. The listener then
     # separates the abandoned part from the real message with split_abandoned (below).
     data = VT + b"MSH|partial" + frame(MSG_B)
-    assert read_all([data]) == [b"MSH|partial" + VT + MSG_B, None]
+    assert payloads([data]) == [b"MSH|partial" + VT + MSG_B]
 
 
 # --- splitting off abandoned frames ------------------------------------------------
@@ -118,26 +116,6 @@ def test_split_allows_whitespace_or_bom_before_the_new_msh():
         assert split_abandoned(b"MSH|partial" + VT + gap + MSG_B) == (b"MSH|partial", gap + MSG_B)
 
 
-def test_block_without_start_byte_is_an_error_but_stream_stays_usable():
-    results = read_all([b"garbage" + FS_CR + frame(MSG_A)])
-    assert isinstance(results[0], FramingError)
-    assert results[1:] == [MSG_A, None]
-
-
-def test_clean_close_between_frames_returns_none():
-    assert read_all([]) == [None]
-
-
-def test_close_mid_frame_returns_none_without_a_message():
-    # Never completed, so never ACKed: the sender will resend it.
-    assert read_all([frame(MSG_A)[:-5]]) == [None]
-
-
-def test_frame_over_the_limit_raises():
-    results = read_all([frame(b"x" * 500)], limit=100)
-    assert isinstance(results[0], FrameTooLarge)
-
-
 def test_python_hl7_writer_frames_payload():
     """The ACK is sent with python-hl7's writeblock; check what it puts on the wire."""
     from hl7.mllp import MLLPStreamWriter
@@ -165,29 +143,11 @@ def test_python_hl7_writer_frames_payload():
     assert transport.data == VT + MSG_A + FS_CR
 
 
-@pytest.mark.parametrize("noise", [b"\r\n", b"   ", b"\x00\x00"])
-def test_any_noise_before_start_byte_is_dropped(noise):
-    assert read_all([noise + frame(MSG_A)]) == [MSG_A, None]
-
-
 # --- read_block: nothing is dropped silently -----------------------------------------
 
 
-def blocks(chunks: list[bytes], limit: int = 2**16, n: int = 1):
-    """Feed `chunks` (then EOF) and return the next `n` results of read_block."""
-
-    async def run():
-        reader = asyncio.StreamReader(limit=limit)
-        for chunk in chunks:
-            reader.feed_data(chunk)
-        reader.feed_eof()
-        return [await read_block(reader) for _ in range(n)]
-
-    return asyncio.run(run())
-
-
 def test_block_reports_noise_before_the_frame():
-    [b] = blocks([b"garbage" + frame(MSG_A)])
+    b, _end = read_blocks([b"garbage" + frame(MSG_A)])
     assert b.payload == MSG_A
     assert b.discarded == b"garbage"
     assert "before the frame start" in b.reason
@@ -196,13 +156,13 @@ def test_block_reports_noise_before_the_frame():
 
 def test_block_ignores_whitespace_between_frames():
     # A newline after each frame is common and harmless: not bad data, nothing to keep.
-    [b] = blocks([b"\r\n" + frame(MSG_A)])
+    b, _end = read_blocks([b"\r\n" + frame(MSG_A)])
     assert (b.payload, b.discarded) == (MSG_A, b"")
 
 
 def test_block_without_start_byte_is_handed_back_whole():
     data = b"MSH|no start byte" + FS_CR
-    first, second = blocks([data + frame(MSG_A)], n=2)
+    first, second, _end = read_blocks([data + frame(MSG_A)])
     assert first.payload is None
     assert first.discarded == data  # exact bytes as received, end marker included
     assert "no <VT>" in first.reason
@@ -212,7 +172,7 @@ def test_block_without_start_byte_is_handed_back_whole():
 
 def test_block_cut_off_by_disconnect_is_handed_back():
     cut = VT + b"MSH|cut off"
-    [b] = blocks([cut])
+    [b] = read_blocks([cut])
     assert b.payload is None and b.end_of_stream
     assert b.discarded == cut
     assert "closed mid-frame" in b.reason
@@ -221,13 +181,14 @@ def test_block_cut_off_by_disconnect_is_handed_back():
 
 def test_clean_disconnect_has_nothing_to_keep():
     for tail in (b"", b"\r\n"):
-        [b] = blocks([tail])
+        [b] = read_blocks([tail])
         assert (b.payload, b.discarded, b.end_of_stream) == (None, b"", True)
 
 
 def test_oversized_frame_hands_back_what_was_received():
-    [b] = blocks([VT + b"x" * 500 + FS_CR], limit=100)
+    [b] = read_blocks([VT + b"x" * 500 + FS_CR], limit=100)
     assert b.payload is None and b.too_large
     assert b.discarded.startswith(VT + b"xxx")
     assert "size limit" in b.reason
     assert b.kind == "too_large"
+
