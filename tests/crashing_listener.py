@@ -30,16 +30,23 @@ CRASH_ON = int(os.environ.get("CRASH_ON", "1"))
 RAW_DIR = Path(os.environ["RAW_DIR"])
 STREAM = os.environ.get("RAW_STREAM", RAW_STREAM)
 
-_hits = 0
-_lock = threading.Lock()  # saves run in worker threads
+
+class CrashOnNthCall:
+    """Exit the process the n-th time it's called. Thread-safe: saves run in worker threads."""
+
+    def __init__(self, n):
+        self.n = n
+        self.calls = 0
+        self.lock = threading.Lock()
+
+    def __call__(self):
+        with self.lock:
+            self.calls += 1
+            if self.calls == self.n:
+                os._exit(70)  # immediately, skipping every finally block
 
 
-def count_and_maybe_crash():
-    global _hits
-    with _lock:
-        _hits += 1
-        if _hits == CRASH_ON:
-            os._exit(70)  # immediately, skipping every finally block
+count_and_maybe_crash = CrashOnNthCall(CRASH_ON)
 
 
 original_save_raw = LocalRawStore.save_raw

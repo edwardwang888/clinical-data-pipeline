@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import socket
+import threading
 import time
 from collections.abc import Callable
 
@@ -186,16 +187,11 @@ def main() -> None:
         consumer=os.environ.get("CONSUMER_NAME") or None,
     )
 
-    stopping = False
-
-    def stop(*_):
-        nonlocal stopping
-        stopping = True
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
+    stop = threading.Event()  # set by SIGTERM (docker stop) or SIGINT (Ctrl-C)
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
     log.info("consuming stream=%s group=%s consumer=%s", consumer.stream, consumer.group, consumer.consumer)
-    consumer.run_forever(should_stop=lambda: stopping)
+    consumer.run_forever(should_stop=stop.is_set)
     log.info("stopped")
 
 
