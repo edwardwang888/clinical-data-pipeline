@@ -6,8 +6,10 @@ listener can't identify get AR, after their bytes are kept as evidence.
 """
 
 import asyncio
+import base64
 import hashlib
 import logging
+import tempfile
 import threading
 
 import pytest
@@ -81,14 +83,18 @@ class EvidenceStore:
         return self.inner.load_raw(key)
 
 
-class NoRejectsExpected:
-    """Default rejected-store for tests about valid messages: any reject is a bug."""
+class DeadLetters:
+    """Records what the listener publishes to the dead-letter queue (hl7.dlq)."""
 
-    def save_raw(self, raw, meta):
-        raise AssertionError(f"valid message was rejected: {meta.get('header_error')}")
+    def __init__(self):
+        self.entries = []
+        self.fail = False
 
-    def load_raw(self, key):
-        raise AssertionError("nothing should be in the rejected area")
+    def publish(self, event):
+        if self.fail:
+            raise ConnectionError("redis down")
+        self.entries.append(event)
+        return f"{len(self.entries)}-0"
 
 
 def frame(payload):
@@ -107,11 +113,18 @@ async def wait_until(condition, timeout=5.0):
             await asyncio.sleep(0.01)
 
 
-def run_with_listener(store, publisher, body, rejected=None):
-    """Start the listener, connect a client, run `body(reader, writer)`, clean up."""
+def run_with_listener(store, publisher, body, rejected=None, dlq=None):
+    """Start the listener, connect a client, run `body(reader, writer)`, clean up.
+
+    Tests that don't pass `rejected` and `dlq` are about valid input: for those we check
+    afterwards that nothing reached the evidence area or the dead-letter queue.
+    """
+    expect_no_dead_letters = rejected is None and dlq is None
+    rejected = rejected or EvidenceStore(tempfile.mkdtemp())
+    dlq = dlq or DeadLetters()
 
     async def main():
-        listener = Listener(store, publisher, rejected or NoRejectsExpected())
+        listener = Listener(store, publisher, rejected, dlq)
         server = await start_hl7_server(listener.handle_connection, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -124,7 +137,11 @@ def run_with_listener(store, publisher, body, rejected=None):
             server.close()
             await listener.close_connections()
 
-    return asyncio.run(main())
+    result = asyncio.run(main())
+    if expect_no_dead_letters:
+        assert rejected.saved == [], "a valid message was rejected or treated as bad input"
+        assert dlq.entries == [], "a valid message reached the dead-letter queue"
+    return result
 
 
 @pytest.fixture
@@ -146,6 +163,23 @@ def publisher(order):
 def rejected(tmp_path_factory):
     # A separate folder from the raw archive (tmp_path), like data/rejected vs data/raw.
     return EvidenceStore(tmp_path_factory.mktemp("rejected"))
+
+
+@pytest.fixture
+def dlq():
+    return DeadLetters()
+
+
+def assert_dead_letter(entry, saved, data, kind, reply):
+    """A DLQ entry points at the evidence file and identifies the exact bytes."""
+    assert entry["stage"] == "listener"
+    assert entry["kind"] == kind
+    assert entry["reply"] == reply
+    assert entry["reason"]
+    assert entry["evidence_key"] == saved.key
+    assert entry["raw_message_id"] == hashlib.sha256(data).hexdigest()
+    assert entry["size_bytes"] == len(data)
+    assert "payload_b64" not in entry  # the bytes are in the evidence file
 
 
 def test_happy_path_order_is_save_publish_ack(store, publisher, order):
@@ -245,22 +279,24 @@ def test_connection_keeps_working_after_an_ae(store, publisher):
     ],
     ids=["not-hl7", "empty-frame", "no-control-id"],
 )
-def test_unidentifiable_message_is_kept_as_evidence_and_rejected(store, publisher, rejected, tmp_path, junk):
+def test_unidentifiable_message_is_kept_as_evidence_and_rejected(store, publisher, rejected, dlq, tmp_path, junk):
     """No readable MSH, control ID or message type: keep the exact bytes as evidence,
-    never queue them, and reply AR so the sender stops resending."""
+    record it in the dead-letter queue, never queue it for processing, and reply AR so
+    the sender stops resending."""
 
     async def body(reader, writer):
         writer.write(frame(junk))
         return await asyncio.wait_for(read_frame(reader), 5)
 
-    ack = run_with_listener(store, publisher, body, rejected)
+    ack = run_with_listener(store, publisher, body, rejected, dlq)
     assert msa(ack)[1] == "AR"
     assert msa(ack)[3].startswith("rejected")
     assert publisher.events == []
     assert list(tmp_path.rglob("*.hl7")) == []  # nothing in the raw archive
     [saved] = rejected.saved
     assert rejected.load_raw(saved.key) == junk
-    assert saved.meta["header_error"]
+    [entry] = dlq.entries
+    assert_dead_letter(entry, saved, junk, kind="unidentifiable", reply="AR")
 
 
 def test_reject_waits_for_the_evidence_to_be_saved(store, publisher, rejected):
@@ -272,9 +308,22 @@ def test_reject_waits_for_the_evidence_to_be_saved(store, publisher, rejected):
         writer.write(frame(b"not hl7"))
         return await asyncio.wait_for(read_frame(reader), 5)
 
-    ack = run_with_listener(store, publisher, body, rejected)
+    ack = run_with_listener(store, publisher, body, rejected, DeadLetters())
     assert msa(ack)[1] == "AE"
     assert publisher.events == []
+
+
+def test_reject_waits_for_the_dead_letter_entry(store, publisher, rejected, dlq):
+    # AR is sent only once the evidence is saved AND the DLQ entry is published; if the
+    # DLQ is down, reply AE so the sender tries again.
+    dlq.fail = True
+
+    async def body(reader, writer):
+        writer.write(frame(b"not hl7"))
+        return await asyncio.wait_for(read_frame(reader), 5)
+
+    ack = run_with_listener(store, publisher, body, rejected, dlq)
+    assert msa(ack)[1] == "AE"
 
 
 def test_byte_order_mark_before_msh_is_accepted_and_stored_exactly(store, publisher):
@@ -343,7 +392,7 @@ def test_vt_byte_inside_a_message_is_stored_whole_and_acked_correctly(store, pub
     ],
     ids=["partial-msh", "noise-with-vt", "cut-inside-msh", "cut-after-msh"],
 )
-def test_message_after_an_abandoned_frame_gets_its_own_aa(store, publisher, rejected, before):
+def test_message_after_an_abandoned_frame_gets_its_own_aa(store, publisher, rejected, dlq, before):
     """Regression: the sender started a frame, gave up, then sent a valid message on the
     same connection. The valid message must be stored whole and get its own AA. It
     previously got AR (or an ACK for the fragment's control ID) and never got through."""
@@ -356,25 +405,26 @@ def test_message_after_an_abandoned_frame_gets_its_own_aa(store, publisher, reje
             await asyncio.wait_for(read_frame(reader), 0.3)
         return ack
 
-    ack = run_with_listener(store, publisher, body, rejected)
+    ack = run_with_listener(store, publisher, body, rejected, dlq)
     assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
     [event] = publisher.events
     assert store.load_raw(event["raw_key"]) == MSG
-    # The fragment is kept as evidence, minus its <VT> framing byte, and never queued.
+    # The fragment is kept as evidence (minus its <VT> framing byte) and dead-lettered.
     [saved] = rejected.saved
     assert rejected.load_raw(saved.key) == before[1:]
-    assert saved.meta["header_error"].startswith("abandoned partial frame")
+    [entry] = dlq.entries
+    assert_dead_letter(entry, saved, before[1:], kind="abandoned_frame", reply="none")
 
 
 # --- nothing is dropped silently ------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "before",
-    [b"garbage", b"MSH|no start byte\x1c\r"],
+    "before, kind",
+    [(b"garbage", "noise_before_frame"), (b"MSH|no start byte\x1c\r", "no_start_byte")],
     ids=["noise-before-frame", "block-without-start-byte"],
 )
-def test_unusable_bytes_are_kept_as_evidence(store, publisher, rejected, before):
+def test_unusable_bytes_are_kept_as_evidence(store, publisher, rejected, dlq, before, kind):
     async def body(reader, writer):
         writer.write(before + frame(MSG))
         ack = await asyncio.wait_for(read_frame(reader), 5)
@@ -382,44 +432,47 @@ def test_unusable_bytes_are_kept_as_evidence(store, publisher, rejected, before)
             await asyncio.wait_for(read_frame(reader), 0.3)
         return ack
 
-    ack = run_with_listener(store, publisher, body, rejected)
+    ack = run_with_listener(store, publisher, body, rejected, dlq)
     assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
     [event] = publisher.events
     assert store.load_raw(event["raw_key"]) == MSG
     [saved] = rejected.saved
     assert rejected.load_raw(saved.key) == before  # exact bytes as received
-    assert saved.meta["header_error"]  # the reason
+    [entry] = dlq.entries
+    assert_dead_letter(entry, saved, before, kind=kind, reply="none")
 
 
-def test_whitespace_between_frames_is_not_kept(store, publisher, rejected):
+def test_whitespace_between_frames_is_not_kept(store, publisher, rejected, dlq):
     async def body(reader, writer):
         writer.write(b"\r\n" + frame(MSG) + b"\r\n" + frame(MSG2))
         return [await asyncio.wait_for(read_frame(reader), 5) for _ in range(2)]
 
-    acks = run_with_listener(store, publisher, body, rejected)
+    acks = run_with_listener(store, publisher, body, rejected, dlq)
     assert [msa(a)[1] for a in acks] == ["AA", "AA"]
     assert rejected.saved == []
+    assert dlq.entries == []
 
 
-def test_frame_cut_off_by_a_disconnect_is_kept_as_evidence(store, publisher, rejected):
+def test_frame_cut_off_by_a_disconnect_is_kept_as_evidence(store, publisher, rejected, dlq):
     cut = b"\x0bMSH|^~\\&|SIMHOSP|SYNTH_GENERAL|CDP|CDP|2026"
 
     async def body(reader, writer):
         writer.write(frame(MSG) + cut)
         ack = await asyncio.wait_for(read_frame(reader), 5)
         writer.close()  # the sender disconnects before finishing the second frame
-        await wait_until(lambda: rejected.saved)
+        await wait_until(lambda: dlq.entries)
         return ack
 
-    ack = run_with_listener(store, publisher, body, rejected)
+    ack = run_with_listener(store, publisher, body, rejected, dlq)
     assert msa(ack)[1] == "AA"
     [saved] = rejected.saved
     assert rejected.load_raw(saved.key) == cut
-    assert "closed mid-frame" in saved.meta["header_error"]
+    [entry] = dlq.entries
+    assert_dead_letter(entry, saved, cut, kind="cut_off_by_disconnect", reply="none")
     assert len(publisher.events) == 1  # only the complete message was queued
 
 
-def test_oversized_frame_is_kept_as_evidence_and_the_connection_closed(store, publisher, rejected):
+def test_oversized_frame_is_kept_as_evidence_and_the_connection_closed(store, publisher, rejected, dlq):
     # The test server uses python-hl7's default 64 KiB limit; send more than that.
     big = MSG + b"NTE|1||" + b"x" * 100_000 + b"\r"
 
@@ -429,27 +482,47 @@ def test_oversized_frame_is_kept_as_evidence_and_the_connection_closed(store, pu
             reply = await asyncio.wait_for(read_frame(reader), 5)
         except ConnectionError:
             reply = None  # closed with unread data: the client sees a reset
-        await wait_until(lambda: rejected.saved)
+        await wait_until(lambda: dlq.entries)
         return reply
 
-    assert run_with_listener(store, publisher, body, rejected) is None  # no ACK
+    assert run_with_listener(store, publisher, body, rejected, dlq) is None  # no ACK
     [saved] = rejected.saved
-    assert rejected.load_raw(saved.key).startswith(b"\x0b" + MSG)
-    assert "size limit" in saved.meta["header_error"]
+    kept = rejected.load_raw(saved.key)
+    assert kept.startswith(b"\x0b" + MSG)
+    [entry] = dlq.entries
+    assert_dead_letter(entry, saved, kept, kind="too_large", reply="none")
     assert publisher.events == []
 
 
-def test_failed_evidence_save_is_still_logged(store, publisher, rejected, caplog):
-    # If even the evidence can't be saved, the log still records it (with its hash),
-    # and the valid message after it is unaffected.
+def test_failed_evidence_save_puts_the_bytes_in_the_dead_letter_entry(store, publisher, rejected, dlq):
+    # If the evidence file can't be saved, the DLQ entry carries the bytes themselves,
+    # and the valid message after them is unaffected.
     rejected.fail = True
-    caplog.set_level(logging.WARNING)
 
     async def body(reader, writer):
         writer.write(b"garbage" + frame(MSG))
         return await asyncio.wait_for(read_frame(reader), 5)
 
-    ack = run_with_listener(store, publisher, body, rejected)
+    ack = run_with_listener(store, publisher, body, rejected, dlq)
     assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
-    assert "could not keep" in caplog.text
+    [entry] = dlq.entries
+    assert entry["evidence_key"] == ""
+    assert base64.b64decode(entry["payload_b64"]) == b"garbage"
+    assert entry["raw_message_id"] == hashlib.sha256(b"garbage").hexdigest()
+
+
+def test_dead_letter_queue_down_falls_back_to_the_log(store, publisher, rejected, dlq, caplog):
+    # Last resort, only when the DLQ itself is unreachable: the log records the bytes'
+    # size, hash and where the evidence file is, so the input is still traceable.
+    dlq.fail = True
+    caplog.set_level(logging.ERROR)
+
+    async def body(reader, writer):
+        writer.write(b"garbage" + frame(MSG))
+        return await asyncio.wait_for(read_frame(reader), 5)
+
+    ack = run_with_listener(store, publisher, body, rejected, dlq)
+    assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
+    [saved] = rejected.saved
     assert hashlib.sha256(b"garbage").hexdigest() in caplog.text
+    assert saved.key in caplog.text

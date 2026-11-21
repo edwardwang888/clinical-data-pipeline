@@ -47,6 +47,7 @@ class Block:
     payload: bytes | None
     discarded: bytes = b""
     reason: str = ""
+    kind: str = ""  # short code for `discarded`, e.g. "noise_before_frame" (for the DLQ)
     end_of_stream: bool = False  # the connection ended
     too_large: bool = False  # a frame exceeded the size limit: close the connection
 
@@ -59,13 +60,15 @@ async def read_block(reader: asyncio.StreamReader) -> Block:
         # The connection ended. Leftover bytes are a frame that was never completed (so
         # never ACKed; the sender resends it if it was real).
         leftover = e.partial if e.partial.strip() else b""
-        return Block(None, leftover, "connection closed mid-frame" if leftover else "", end_of_stream=True)
+        if not leftover:
+            return Block(None, end_of_stream=True)
+        return Block(None, leftover, "connection closed mid-frame", "cut_off_by_disconnect", end_of_stream=True)
     except asyncio.LimitOverrunError as e:
         # The frame is too big to buffer. Hand back what was received so far (it stays in
         # the reader's buffer after the error); the connection can't be resynced.
         head = await reader.read(max(e.consumed, 1))
         reason = f"frame exceeded the size limit; first {len(head)} bytes kept"
-        return Block(None, head, reason, too_large=True)
+        return Block(None, head, reason, "too_large", too_large=True)
 
     # The frame starts at the *first* <VT>; only bytes before it are noise. A later
     # <VT> stays in the payload: it may be a stray byte inside the message, or an
@@ -73,10 +76,10 @@ async def read_block(reader: asyncio.StreamReader) -> Block:
     # we keep every byte, because cutting there would store a fragment and ACK it.
     start = block.find(START_BLOCK)
     if start == -1:
-        return Block(None, block, "block ended with <FS><CR> but had no <VT> start byte")
+        return Block(None, block, "block ended with <FS><CR> but had no <VT> start byte", "no_start_byte")
     noise = block[:start]
     if noise.strip():
-        return Block(block[start + 1 : -len(END_BLOCK)], noise, "bytes before the frame start")
+        return Block(block[start + 1 : -len(END_BLOCK)], noise, "bytes before the frame start", "noise_before_frame")
     return Block(block[start + 1 : -len(END_BLOCK)])
 
 

@@ -191,6 +191,7 @@ def test_block_reports_noise_before_the_frame():
     assert b.payload == MSG_A
     assert b.discarded == b"garbage"
     assert "before the frame start" in b.reason
+    assert b.kind == "noise_before_frame"
 
 
 def test_block_ignores_whitespace_between_frames():
@@ -205,6 +206,7 @@ def test_block_without_start_byte_is_handed_back_whole():
     assert first.payload is None
     assert first.discarded == data  # exact bytes as received, end marker included
     assert "no <VT>" in first.reason
+    assert first.kind == "no_start_byte"
     assert second.payload == MSG_A  # and the stream is still in sync
 
 
@@ -214,6 +216,7 @@ def test_block_cut_off_by_disconnect_is_handed_back():
     assert b.payload is None and b.end_of_stream
     assert b.discarded == cut
     assert "closed mid-frame" in b.reason
+    assert b.kind == "cut_off_by_disconnect"
 
 
 def test_clean_disconnect_has_nothing_to_keep():
@@ -227,3 +230,4 @@ def test_oversized_frame_hands_back_what_was_received():
     assert b.payload is None and b.too_large
     assert b.discarded.startswith(VT + b"xxx")
     assert "size limit" in b.reason
+    assert b.kind == "too_large"

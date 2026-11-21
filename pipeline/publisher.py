@@ -16,6 +16,9 @@ import redis
 
 # Stream that the listener publishes "new raw message" events to.
 RAW_STREAM = "hl7.raw"
+# Dead-letter queue: one entry per bad input (stage=listener now; later stages may add
+# entries for messages they keep failing on). Each points at its evidence file.
+DLQ_STREAM = "hl7.dlq"
 
 
 class Publisher(Protocol):
