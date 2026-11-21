@@ -224,6 +224,8 @@ Every injected change is logged so checks can be scored against what was actuall
 | Stray bytes between frames | Skipped before the `0x0B`; the message itself is kept |
 | Abandoned partial frame (a new `0x0B` + `MSH` before the end marker) | The fragment is kept in `data/rejected/` with no reply; the new message is stored and ACKed on its own |
 | Stray `0x0B` inside a message | Kept as content (it doesn't start a new `MSH`); the message is stored whole |
+| HL7 batch in one frame (`FHS`/`BHS` instead of `MSH`) | Out of scope for now: gets `AR`, bytes kept in `data/rejected/`. Real-time MLLP feeds send single messages; batches mostly arrive as files |
+| Multibyte charset header (Big5, GB 18030, ISO-2022-JP; MSH-18) with non-ASCII text in MSH-3–8 | Known limitation: a character's second byte can equal `|`, shifting the fields, so the message can be wrongly rejected (`AR`). Fix later by decoding the header per MSH-18 before splitting; test it with the messiness injector (milestone 2) |
 | Consumer falls behind | Lag alert; pending messages redelivered |
 
 ## Local stack
