@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import socket
+import time
 from collections.abc import Callable
 
 import redis
@@ -102,12 +103,39 @@ class RawEventConsumer:
         """Handle events never delivered to anyone yet (waits up to `block_ms`)."""
         return self._handle(self._read(">", block_ms))
 
-    def run_forever(self, block_ms: int = 5000, should_stop: Callable[[], bool] = lambda: False) -> None:
-        self.ensure_group()
-        self.process_own_pending()
+    def run_forever(
+        self,
+        block_ms: int = 5000,
+        should_stop: Callable[[], bool] = lambda: False,
+        retry_delay: float = 0.5,
+        max_retry_delay: float = 10.0,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        """Process events until `should_stop()` returns True.
+
+        If Redis is unreachable (down, restarting, or still loading its data), wait and
+        retry with a growing delay instead of crashing. After reconnecting, first re-read
+        our own pending events: anything we received but hadn't XACKed when Redis went
+        away is still waiting for us.
+        """
+        sleep = sleep or (lambda seconds: _wait(seconds, should_stop))
+        delay = retry_delay
+        connected = False
         while not should_stop():
-            self.claim_stale()
-            self.process_new(block_ms)
+            try:
+                if not connected:
+                    self.ensure_group()
+                    self.process_own_pending()
+                    connected = True
+                self.claim_stale()
+                self.process_new(block_ms)
+                delay = retry_delay
+            except (redis.ConnectionError, redis.TimeoutError) as e:
+                # (redis-py's "still loading the dataset" error is a ConnectionError too.)
+                log.warning("Redis unavailable (%s); retrying in %.1fs", e, delay)
+                connected = False
+                sleep(delay)
+                delay = min(delay * 2, max_retry_delay)
 
     def _read(self, start_id: str, block_ms: int | None) -> list[tuple[str, dict | None]]:
         response = self.client.xreadgroup(
@@ -134,6 +162,13 @@ class RawEventConsumer:
             self.client.xack(self.stream, self.group, event_id)
             handled += 1
         return handled
+
+
+def _wait(seconds: float, should_stop: Callable[[], bool]) -> None:
+    """Sleep up to `seconds`, but wake early if asked to stop (so SIGTERM is quick)."""
+    deadline = time.monotonic() + seconds
+    while not should_stop() and time.monotonic() < deadline:
+        time.sleep(min(0.2, max(deadline - time.monotonic(), 0)))
 
 
 def main() -> None:

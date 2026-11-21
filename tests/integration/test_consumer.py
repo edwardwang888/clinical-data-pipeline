@@ -2,6 +2,7 @@
 crash, and claiming events a dead consumer left behind."""
 
 import pytest
+import redis
 
 from pipeline.consumer import RawEventConsumer
 from pipeline.publisher import RedisStreamPublisher
@@ -95,4 +96,61 @@ def test_events_held_by_a_dead_consumer_are_claimed(redis_client, stream_name):
     )
     assert survivor.claim_stale() == 2
     assert seen == ["C0", "C1"]
+    assert pending_count(redis_client, stream_name) == 0
+
+
+class FlakyClient:
+    """A real Redis client whose first `failures` calls fail as if Redis were down."""
+
+    def __init__(self, inner, failures):
+        self.inner = inner
+        self.failures = failures
+
+    def __getattr__(self, name):
+        attr = getattr(self.inner, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            if self.failures > 0:
+                self.failures -= 1
+                raise redis.ConnectionError("simulated: Redis is down")
+            return attr(*args, **kwargs)
+
+        return call
+
+
+def test_consumer_waits_out_a_redis_outage_instead_of_crashing(redis_client, stream_name):
+    publish(redis_client, stream_name, 3)
+    seen, waits = [], []
+    consumer = RawEventConsumer(
+        FlakyClient(redis_client, failures=3),
+        stream_name,
+        consumer="c1",
+        handler=lambda i, f: seen.append(f["control_id"]),
+    )
+
+    consumer.run_forever(block_ms=100, should_stop=lambda: len(seen) == 3, sleep=waits.append)
+
+    assert waits == [0.5, 1.0, 2.0]  # waited longer each time Redis was unreachable
+    assert seen == ["C0", "C1", "C2"]
+    assert pending_count(redis_client, stream_name) == 0
+
+
+def test_consumer_rereads_its_pending_events_after_reconnecting(redis_client, stream_name):
+    # c1 received an event but never XACKed it (say Redis went down mid-handling).
+    RawEventConsumer(redis_client, stream_name, consumer="c1").ensure_group()
+    publish(redis_client, stream_name, 1)
+    redis_client.xreadgroup("raw-logger", "c1", {stream_name: ">"}, count=10)
+
+    seen = []
+    consumer = RawEventConsumer(
+        FlakyClient(redis_client, failures=1),
+        stream_name,
+        consumer="c1",
+        handler=lambda i, f: seen.append(f["control_id"]),
+    )
+    consumer.run_forever(block_ms=100, should_stop=lambda: len(seen) == 1, sleep=lambda s: None)
+
+    assert seen == ["C0"]
     assert pending_count(redis_client, stream_name) == 0
