@@ -129,8 +129,9 @@ class Listener:
             }
             event_id = await asyncio.to_thread(self.publisher.publish, event)
         except Exception:
-            log.exception("NOT stored, sending AE peer=%s control_id=%s", peer, header.control_id)
-            return build_ack(header, "AE", text="message not stored; please resend")
+            log.exception("NOT stored and queued, sending AE peer=%s control_id=%s", peer, header.control_id)
+            # The raw file may already be saved; it's the queueing that didn't happen.
+            return build_ack(header, "AE", text="message not queued; please resend")
 
         log.info(
             "stored and queued control_id=%s type=%s key=%s event=%s",
@@ -153,7 +154,7 @@ class Listener:
             await asyncio.to_thread(self.dead_letters.publish, entry)
         except Exception:
             log.exception("could not record rejected message, sending AE peer=%s", peer)
-            return build_ack(header, "AE", text="message not stored; please resend")
+            return build_ack(header, "AE", text="message not recorded; please resend")
         log.debug("rejected (AR) peer=%s reason=%s evidence=%s", peer, header.error, saved.key)
         return build_ack(header, "AR", text=f"rejected: {header.error}")
 

@@ -249,6 +249,8 @@ def test_publish_failure_sends_ae(store, publisher, tmp_path):
 
     ack = run_with_listener(store, publisher, body)
     assert msa(ack)[1] == "AE"
+    # The raw file was saved; it's the queueing that failed, and the text says so.
+    assert msa(ack)[3] == "message not queued; please resend"
     # The raw file stays: when the sender resends, we get a second copy. A duplicate
     # is fine; a message that is ACKed but never queued would not be.
     assert len(list(tmp_path.rglob("*.hl7"))) == 1
