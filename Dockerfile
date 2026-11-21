@@ -2,7 +2,9 @@
 # docker-compose.yml picks the command.
 FROM python:3.12-slim
 
-RUN pip install --no-cache-dir uv==0.11.32
+# uv is installed from a hash-pinned requirements file, so a tampered download is refused.
+COPY uv-requirements.txt /tmp/uv-requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/uv-requirements.txt
 
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
