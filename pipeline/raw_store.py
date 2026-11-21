@@ -151,10 +151,7 @@ def _make_dirs(directory: Path) -> None:
         missing.append(d)
         d = d.parent
     for d in reversed(missing):
-        try:
-            d.mkdir()
-        except FileExistsError:
-            pass  # another connection created it at the same moment
+        d.mkdir(exist_ok=True)  # another connection may have just created it
         _fsync_dir(d.parent)
 
 

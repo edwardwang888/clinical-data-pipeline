@@ -95,7 +95,7 @@ class RawEventConsumer:
                 self.stream, self.group, self.consumer, self.claim_idle_ms, start, count=BATCH
             )
             handled += self._handle(entries)
-            if next_start in ("0-0", b"0-0"):
+            if next_start == "0-0":  # the scan wrapped around: nothing left to claim
                 return handled
             start = next_start
 

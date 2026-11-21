@@ -4,7 +4,7 @@ crash, and claiming events a dead consumer left behind."""
 import pytest
 import redis
 
-from pipeline.consumer import RawEventConsumer
+from pipeline.consumer import DEFAULT_GROUP, RawEventConsumer
 from pipeline.publisher import RedisStreamPublisher
 
 pytestmark = pytest.mark.integration
@@ -15,8 +15,8 @@ def publish(client, stream, n):
     return [publisher.publish({"control_id": f"C{i}", "raw_key": f"k{i}"}) for i in range(n)]
 
 
-def pending_count(client, stream, group="raw-logger"):
-    return client.xpending(stream, group)["pending"]
+def pending_count(client, stream):
+    return client.xpending(stream, DEFAULT_GROUP)["pending"]
 
 
 def test_handles_and_xacks_every_event(redis_client, stream_name):
@@ -83,7 +83,7 @@ def test_events_held_by_a_dead_consumer_are_claimed(redis_client, stream_name):
     dead.ensure_group()
     publish(redis_client, stream_name, 2)
     # "dead" receives the events, then dies without XACKing them.
-    redis_client.xreadgroup("raw-logger", "dead", {stream_name: ">"}, count=10)
+    redis_client.xreadgroup(DEFAULT_GROUP, "dead", {stream_name: ">"}, count=10)
     assert pending_count(redis_client, stream_name) == 2
 
     seen = []
@@ -141,7 +141,7 @@ def test_consumer_rereads_its_pending_events_after_reconnecting(redis_client, st
     # c1 received an event but never XACKed it (say Redis went down mid-handling).
     RawEventConsumer(redis_client, stream_name, consumer="c1").ensure_group()
     publish(redis_client, stream_name, 1)
-    redis_client.xreadgroup("raw-logger", "c1", {stream_name: ">"}, count=10)
+    redis_client.xreadgroup(DEFAULT_GROUP, "c1", {stream_name: ">"}, count=10)
 
     seen = []
     consumer = RawEventConsumer(
