@@ -24,14 +24,16 @@ duplicates, corrections, late data and replay. Scale is not the point.
 
 ```
 producer ──MLLP──▶ listener :2575 ──▶ data/raw/... (.hl7 + .json)
+                        │   │
+                        │   └──XADD──▶ Redis stream hl7.raw ──▶ consumer (logs + XACK)
                         │
-                        └──XADD──▶ Redis stream hl7.raw ──▶ consumer (logs + XACK)
+                        └── bad input ──▶ data/rejected/... (evidence) + Redis stream hl7.dlq
 ```
 
 | Service | Code | What it does |
 |---|---|---|
 | `producer` | `producer/` | Sends synthetic ADT and lab-result messages (2/s); resends until it gets `AA` |
-| `listener` | `services/listener/` | MLLP server: saves exact bytes, publishes an event, *then* ACKs. Messages it can't identify are kept in `data/rejected/` and get `AR`; any other bytes it can't use (noise, broken or cut-off frames) are kept there too, with the reason |
+| `listener` | `services/listener/` | MLLP server: saves exact bytes, publishes an event, *then* ACKs. Messages it can't identify get `AR`. Those, and any other bytes it can't use (noise, broken or cut-off frames), are kept in `data/rejected/` and recorded in the dead-letter queue `hl7.dlq` with the reason |
 | `redis` | | Redis Streams queue, persisted with an fsync on every write |
 | `consumer` | `pipeline/consumer.py` | Stand-in for the parser: reads `hl7.raw` with a consumer group, logs, XACKs |
 
@@ -53,6 +55,13 @@ make up
 ```bash
 make logs
 ```
+
+```bash
+make dlq
+```
+
+`make dlq` shows the latest dead-letter entries: bad input the listener received, why it
+couldn't be used, and where its exact bytes are kept.
 
 ```bash
 make down

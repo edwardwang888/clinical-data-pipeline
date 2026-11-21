@@ -135,7 +135,14 @@ Every injected change is logged so checks can be scored against what was actuall
   published (and then ACKed) survives a Redis restart.
 - At-least-once and not ordered: consumers must handle duplicates and must not depend on
   arrival order.
-- Messages that keep failing go to a dead-letter stream with the error attached.
+- **Dead-letter queue (`hl7.dlq`, behind the same `Publisher` interface; a Pub/Sub
+  dead-letter topic later).** One entry per bad input, never per log line: `stage`
+  (`listener` now; later stages add entries for messages they keep failing on), `kind`
+  (`unidentifiable`, `noise_before_frame`, `no_start_byte`, `cut_off_by_disconnect`,
+  `too_large`, `abandoned_frame`), `reason`, the `reply` sent (`AR` or `none`), sha256,
+  size, and `evidence_key` pointing at the exact bytes in `data/rejected/`. If that file
+  couldn't be saved, the entry carries the bytes as `payload_b64`. `make dlq` shows the
+  latest entries. Bad input is counted, alerted on and replayed from here.
 
 ### 6. Parser
 
@@ -197,6 +204,7 @@ Every injected change is logged so checks can be scored against what was actuall
 | Queue durability | Redis AOF, `appendfsync always` | Default snapshots / `everysec` | An ACKed event must survive a Redis restart; the speed cost doesn't matter at this scale |
 | Producer | Python producer now; Simulated Hospital later | Build Simulated Hospital from source now | Its image won't pull and the source needs Bazel; milestone 1 only needs correct MLLP + resend behavior |
 | Frame reading | Own `read_frame` on python-hl7's streams, starting at the first `0x0B` | python-hl7 `readblock()` | `readblock()` drops a whole message if any byte precedes `0x0B` |
+| Record of bad input | Dead-letter stream (`hl7.dlq`) entry pointing at an evidence file in `data/rejected/` | Log lines only; or evidence files only | Log lines get lost and can't be acted on. Files alone can't be counted, alerted on or worked through. A DLQ entry is durable, countable and replayable, and maps to Pub/Sub dead-letter topics |
 | Malformed messages at intake | `AR` only when the header can't be read (bytes kept as evidence); everything else stored, `AA`, quarantined at parse | Reject every malformed message; or accept everything, even with no header | Rejecting content errors stalls the sender's queue and loses evidence, and our own parser bugs would block their feed. But an `AA` with no control ID is useless to the sender |
 | Triggering processing | Listener publishes to queue | Storage-event notification (GCS → Pub/Sub) | Both are fine; interface keeps it swappable |
 | Parsing | Own parser (python-hl7) | GCP HL7v2 store + HL7→FHIR | Full control over mapping, history and replay |
@@ -215,7 +223,7 @@ Every injected change is logged so checks can be scored against what was actuall
 | New local code | Kept and flagged; unmapped-code rate alert |
 | Malformed message (readable header) | ACKed (it's stored), then quarantined at parse |
 | Unidentifiable message (no MSH, control ID or message type) | Bytes kept in `data/rejected/`, never queued; `AR` with the reason |
-| Saving rejected evidence fails | `AE`, so the sender retries |
+| Saving rejected evidence, or its DLQ entry, fails | `AE`, so the sender retries (the `AR` waits for both) |
 | Feed goes silent | Freshness alert per feed, aware of time of day |
 | Burst after downtime | Queue absorbs it; listener only stores and ACKs |
 | Listener crashes mid-message | No ACK sent, so the sender retries; duplicates handled downstream |
@@ -226,7 +234,8 @@ Every injected change is logged so checks can be scored against what was actuall
 | Block with an end marker but no `0x0B` | Kept whole in `data/rejected/` with the reason; no reply (it isn't a frame). The stream stays in sync for the next frame |
 | Connection closed mid-frame | The incomplete bytes are kept in `data/rejected/`; never ACKed, so the sender resends |
 | Frame over the size limit (`MAX_MESSAGE_BYTES`) | The bytes received so far are kept in `data/rejected/`, then the connection is closed (the next frame boundary can't be found reliably) |
-| Saving evidence to `data/rejected/` fails | Logged with the bytes' size and sha256; never holds up the messages around it (for an unidentifiable message, the sender gets `AE` and resends) |
+| Saving evidence to `data/rejected/` fails (input with no reply) | The DLQ entry carries the bytes themselves (`payload_b64`); never holds up the messages around it |
+| DLQ unreachable (input with no reply) | Last resort: a log line with the bytes' size, sha256 and evidence file |
 | Abandoned partial frame (a new `0x0B` + `MSH` before the end marker) | The fragment is kept in `data/rejected/` with no reply; the new message is stored and ACKed on its own |
 | Stray `0x0B` inside a message | Kept as content (it doesn't start a new `MSH`); the message is stored whole |
 | HL7 batch in one frame (`FHS`/`BHS` instead of `MSH`) | Out of scope for now: gets `AR`, bytes kept in `data/rejected/`. Real-time MLLP feeds send single messages; batches mostly arrive as files |

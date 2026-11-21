@@ -1,4 +1,4 @@
-.PHONY: up down logs test test-local
+.PHONY: up down logs dlq test test-local
 
 # Containers run as you, so files the listener writes to data/raw are yours, not root's.
 export HOST_UID := $(shell id -u)
@@ -13,6 +13,10 @@ up:
 ## Stop everything (the Redis volume and data/raw are kept).
 down:
 	docker compose down
+
+## Show the latest dead-letter entries: bad input the listener kept as evidence.
+dlq:
+	docker compose exec redis redis-cli XREVRANGE hl7.dlq + - COUNT 20
 
 ## Follow the logs of all services.
 logs:

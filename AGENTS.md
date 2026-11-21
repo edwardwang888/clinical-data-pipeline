@@ -31,11 +31,14 @@ in the same PR (especially the "Key decisions and trade-offs" and "Failure modes
 - **Bad data never blocks the pipeline.** Messages with a readable header but bad contents
   go to quarantine with the error and a pointer to the raw file; they are never rejected
   at the door, so they can't stall the sender's queue.
-- **Nothing is dropped silently.** Any bytes the listener can't use as a message (noise
+- **Nothing is dropped silently; bad input goes to the dead-letter queue, not the logs.**
+  Every unidentifiable message, and any bytes the listener can't use as a message (noise
   before a frame, a block with no start byte, a frame cut off by a disconnect or over the
-  size limit, an abandoned frame) are kept in the rejected area with the reason, and
-  logged. If even that save fails, the log records their size and sha256. Whitespace
-  between frames is the only thing skipped.
+  size limit, an abandoned frame), is kept in the rejected area and gets an entry in the
+  `hl7.dlq` stream with its kind, reason, sha256 and a pointer to that evidence. If the
+  evidence file can't be saved, the entry carries the bytes. Only if the DLQ itself is
+  unreachable does a log line record the input. Whitespace between frames is the only
+  thing skipped.
 - **Lineage everywhere.** Every derived row keeps `raw_message_id` (sha256 of raw bytes)
   and `source_system`.
 
