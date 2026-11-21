@@ -1,0 +1,8 @@
+# Local raw archive, DuckDB files and other data. Never commit data.
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

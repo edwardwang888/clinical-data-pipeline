@@ -1,0 +1,87 @@
+# Milestone 1: producer -> MLLP listener -> raw archive (./data/raw) + Redis stream -> consumer
+#
+#   make up      build and start everything
+#   make logs    follow the logs
+#   make test    run the test suite in a container
+#   make down    stop everything
+name: clinical-data-pipeline
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    # Append-only file, fsynced on every write: an event the listener published (and
+    # then ACKed) survives a Redis restart. Slower than the default, fine at our scale.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  listener:
+    build: .
+    image: clinical-data-pipeline:dev
+    command: ["python", "-m", "services.listener"]
+    # Run as the host user so files in ./data/raw belong to you (set by the Makefile).
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      LISTENER_PORT: "2575"
+      RAW_DIR: /data/raw
+      RAW_REJECTED_DIR: /data/rejected
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data/raw:/data/raw
+      - ./data/rejected:/data/rejected
+    ports:
+      - "2575:2575"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  consumer:
+    image: clinical-data-pipeline:dev
+    command: ["python", "-m", "pipeline.consumer"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CONSUMER_NAME: consumer-1
+    depends_on:
+      redis:
+        condition: service_healthy
+      listener:
+        condition: service_started
+    restart: unless-stopped
+
+  # Stand-in for Simulated Hospital (its published image is not pullable; see DESIGN.md).
+  producer:
+    image: clinical-data-pipeline:dev
+    command: ["python", "-m", "producer"]
+    environment:
+      LISTENER_HOST: listener
+      LISTENER_PORT: "2575"
+      PRODUCER_RATE: "2"   # messages per second
+      PRODUCER_COUNT: "0"  # 0 = run forever
+    depends_on:
+      listener:
+        condition: service_started
+    restart: unless-stopped
+
+  # Only runs with `make test` (profile "test"). Uses Redis DB 15 so it never touches
+  # the stream the running stack uses.
+  tests:
+    # Its own `build:` so `make test` always rebuilds from the current code. Without
+    # it, compose has nothing to build and runs whatever image `make up` built last.
+    build: .
+    image: clinical-data-pipeline:dev
+    profiles: ["test"]
+    command: ["pytest", "-q"]
+    environment:
+      TEST_REDIS_URL: redis://redis:6379/15
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:
