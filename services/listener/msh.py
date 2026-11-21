@@ -69,9 +69,7 @@ def read_msh(raw: bytes) -> MshHeader:
 def _read_msh(raw: bytes) -> MshHeader:
     # Some senders put whitespace or a UTF-8 byte-order mark before MSH. Skip them for
     # reading only; the stored message keeps every byte.
-    data = raw.lstrip()
-    if data.startswith(UTF8_BOM):
-        data = data[len(UTF8_BOM) :].lstrip()
+    data = raw.lstrip().removeprefix(UTF8_BOM).lstrip()
     # Only look at the first segment. Segments should end in \r; tolerate \n too.
     first_segment = re.split(rb"[\r\n]", data, maxsplit=1)[0]
     # Latin-1 maps every byte to exactly one character, so decoding can't fail, and
@@ -79,7 +77,7 @@ def _read_msh(raw: bytes) -> MshHeader:
     # control ID). The raw message itself is never decoded; this is only for metadata.
     text = first_segment.decode("latin-1")
 
-    if not text.startswith("MSH") or len(text) < 8:
+    if not text.startswith("MSH") or len(text) < 8:  # 8 = len("MSH|^~\\&")
         return MshHeader(error="message does not start with an MSH segment")
     sep = text[3]
     if sep.isalnum() or sep.isspace():

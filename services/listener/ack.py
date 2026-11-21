@@ -1,7 +1,9 @@
 """Build HL7 v2 ACK messages (original acknowledgment mode).
 
     AA  Application Accept: we stored the message durably and queued it.
-    AE  Application Error: we could not store it. The sender should resend.
+    AE  Application Error: we could not store it (or its evidence). The sender should resend.
+    AR  Application Reject: the header is unreadable, so we kept the bytes as evidence.
+        Resending the same bytes won't help.
 """
 
 from __future__ import annotations

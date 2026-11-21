@@ -15,14 +15,10 @@ bytes as evidence in a separate "rejected" store, never queues them, and replies
 readable header are always stored and ACKed, however wrong their contents; the parser
 quarantines those later, so problems inside a message never stall the feed.
 
-Nothing is dropped silently, and bad input is recorded in a dead-letter queue (DLQ), not
-in log lines. Every unidentifiable message, and every byte sequence that isn't part of a
-usable message (noise before a frame, a block with no start byte, a frame cut off by a
-disconnect or over the size limit, an abandoned frame), is kept in the rejected store
-and gets an entry in the DLQ stream (hl7.dlq) with its kind, reason, sha256 and a
-pointer to that evidence file. If the evidence file can't be saved, the DLQ entry
-carries the bytes themselves. Only if the DLQ is unreachable too does a log line record
-the input, as a last resort.
+Nothing is dropped silently, and bad input goes to the dead-letter queue (hl7.dlq), not
+to the logs: every unidentifiable message, and any bytes that aren't a usable frame (the
+`kind`s in framing.py, plus abandoned frames), is kept in the rejected store and gets a
+DLQ entry pointing at that evidence. `_dead_letter` describes the fallbacks.
 """
 
 from __future__ import annotations
