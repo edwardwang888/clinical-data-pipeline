@@ -84,9 +84,11 @@ This runs the whole suite in a container against the Compose Redis. Without Dock
 - `tests/unit/`: MLLP framing, MSH header reading and ACKs, raw file naming and
   create-only writes, the "ACK only after save and publish" rule, and producer resends.
 - `tests/integration/`: the consumer against real Redis, and the milestone test. That test
-  sends 1,000 messages over 4 connections, kills the listener partway through (once with
-  SIGKILL, once with SIGTERM), restarts it, and checks that every ACKed message has a raw
-  file with its exact bytes and a queue event.
+  sends 1,000 messages over 4 connections, brings the listener down partway through,
+  restarts it, and checks that every ACKed message has a raw file with its exact bytes
+  and a queue event. It goes down five ways: SIGKILL, SIGTERM, and three crashes at an
+  exact step (after the file is saved, after the event is published, in the middle of
+  writing a file), triggered by `CRASH_AT` in `pipeline/crash_points.py`.
 
 ## Layout
 

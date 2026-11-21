@@ -81,7 +81,7 @@ class ListenerProcess:
     """The real listener (`python -m services.listener`) as a child process, writing to
     `data_dir`/raw and `data_dir`/rejected, with its log in `data_dir`/listener.log."""
 
-    def __init__(self, port, data_dir, redis_url, stream):
+    def __init__(self, port, data_dir, redis_url, stream, extra_env=None):
         self.port = port
         self.raw_dir = data_dir / "raw"
         self.rejected_dir = data_dir / "rejected"
@@ -96,6 +96,7 @@ class ListenerProcess:
             "RAW_STREAM": stream,
             "DLQ_STREAM": f"{stream}.dlq",
             "LOG_LEVEL": "WARNING",
+            **(extra_env or {}),
         }
         self.proc = None
         self.starts = 0

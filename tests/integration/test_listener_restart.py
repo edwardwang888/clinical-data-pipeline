@@ -1,8 +1,10 @@
 """Milestone 1 "done" test: restart the listener mid-stream and lose nothing.
 
-Sends 1,000 messages over 4 concurrent connections to a real listener process, kills it
-partway through (a crash with SIGKILL, and separately a clean stop with SIGTERM),
-starts it again, and lets the senders resend whatever wasn't ACKed.
+Sends 1,000 messages over 4 concurrent connections to a real listener process, brings
+it down partway through, starts it again, and lets the senders resend whatever wasn't
+ACKed. It goes down in five ways: killed from outside (SIGKILL) or stopped cleanly
+(SIGTERM), wherever it happens to be; or crashing by itself at an exact step (see
+pipeline/crash_points.py), so the most dangerous moments are hit on every run.
 
 Then checks the promise: every ACKed message has a raw file with its exact bytes and a
 queue event pointing at such a file. Duplicates are fine; losses are not.
@@ -25,15 +27,26 @@ pytestmark = pytest.mark.integration
 
 N_MESSAGES = 1000
 N_CONNECTIONS = 4
-RESTART_AFTER_ACKS = 400
+RESTART_AFTER_ACKS = 400  # when to kill or stop it from outside
+CRASH_ON_HIT = 400  # when to crash at a crash point: the 400th time it's reached
+
+WAYS_DOWN = {
+    "kill": {"signal": signal.SIGKILL},
+    "clean-stop": {"signal": signal.SIGTERM},
+    "crash-after-save": {"crash_at": "after_save"},
+    "crash-after-publish": {"crash_at": "after_publish"},
+    "crash-mid-write": {"crash_at": "mid_write"},
+}
 
 
-@pytest.mark.parametrize("sig", [signal.SIGKILL, signal.SIGTERM], ids=["crash", "clean-stop"])
+@pytest.mark.parametrize("how", list(WAYS_DOWN))
 def test_no_acked_message_is_lost_when_listener_restarts(
-    tmp_path, redis_url, redis_client, stream_name, sig
+    tmp_path, redis_url, redis_client, stream_name, how
 ):
+    way = WAYS_DOWN[how]
+    crash_env = {"CRASH_AT": way["crash_at"], "CRASH_ON": str(CRASH_ON_HIT)} if "crash_at" in way else {}
     port = free_port()
-    listener = ListenerProcess(port, tmp_path, redis_url, stream_name)
+    listener = ListenerProcess(port, tmp_path, redis_url, stream_name, extra_env=crash_env)
     raw_dir = listener.raw_dir
     messages = MessageGenerator(seed=2026, run_id="IT").take(N_MESSAGES)
     sent_bytes = {m.raw for m in messages}
@@ -50,9 +63,13 @@ def test_no_acked_message_is_lost_when_listener_restarts(
         return sender.resends
 
     async def restart_midway():
-        while len(acked) < RESTART_AFTER_ACKS:
-            await asyncio.sleep(0.002)
-        await asyncio.to_thread(listener.stop, sig)
+        if "signal" in way:
+            while len(acked) < RESTART_AFTER_ACKS:
+                await asyncio.sleep(0.002)
+            await asyncio.to_thread(listener.stop, way["signal"])
+        else:
+            await asyncio.to_thread(listener.proc.wait, 120)  # it crashes by itself
+            del listener.env["CRASH_AT"]  # and comes back up normally
         await asyncio.sleep(0.3)  # downtime: senders get "connection refused" and back off
         await asyncio.to_thread(listener.start)
 
@@ -104,9 +121,20 @@ def test_no_acked_message_is_lost_when_listener_restarts(
     missing_events = [cid for cid, raw in acked.items() if raw not in queued[cid]]
     assert missing_events == [], f"{len(missing_events)} ACKed messages have no queue event"
 
+    # Proof that each crash point crashed where intended (the checks above are the same
+    # whichever way it went down).
+    if how == "crash-after-save":
+        event_keys = {fields["raw_key"] for _event_id, fields in events}
+        orphans = [p for p in hl7_files if str(p.relative_to(raw_dir)) not in event_keys]
+        assert orphans, "expected the raw file saved just before the crash, with no event"
+    if how == "crash-after-publish":
+        assert any(len(copies) > 1 for copies in queued.values()), "expected a message queued twice"
+    if how == "crash-mid-write":
+        assert list(raw_dir.rglob(".tmp-*")), "expected the temp file being written at the crash"
+
     duplicates = len(events) - N_MESSAGES
     print(
-        f"\n[{signal.Signals(sig).name}] {N_MESSAGES} ACKed, {resends} resends, "
+        f"\n[{how}] {N_MESSAGES} ACKed, {resends} resends, "
         f"{len(hl7_files)} raw files, {len(events)} events ({duplicates} duplicates), "
         f"{len(list(raw_dir.rglob('.tmp-*')))} leftover temp files"
     )

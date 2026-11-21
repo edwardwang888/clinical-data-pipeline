@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
+from pipeline.crash_points import crash_point
+
 # Same bytes received in the same microsecond get suffixes _1, _2, ... This bound only
 # stops a runaway loop; in practice the first or second name is free.
 _MAX_NAME_ATTEMPTS = 1000
@@ -138,6 +140,7 @@ def _write_create_only(path: Path, data: bytes) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        crash_point("mid_write")
         os.link(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
