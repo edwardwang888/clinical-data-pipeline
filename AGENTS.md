@@ -79,7 +79,9 @@ data/                  local raw archive, DuckDB files (gitignored)
   class, or a `threading.Event` for a stop flag. Module-level names are for constants,
   loggers and other values that never change after startup.
 - **No test-only behaviour in production code.** No hooks, flags or environment checks
-  that exist only for tests, so nothing in production can trigger them by accident. Tests
+  that exist only for tests, so nothing in production can trigger them by accident. That
+  includes parameters only tests pass, such as an injectable `sleep` to skip real waits:
+  patch the function instead (the consumer tests patch `pipeline.consumer._wait`). Tests
   change behaviour from the outside with `unittest.mock`. When the code under test runs in
   a child process, patch it in a test-only entry point under `tests/` (see
   `tests/crashing_listener.py`).
