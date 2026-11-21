@@ -11,11 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 log = logging.getLogger(__name__)
 
 START_BLOCK = b"\x0b"  # <VT>
 END_BLOCK = b"\x1c\x0d"  # <FS><CR>
+
+# A <VT> that is followed (after optional whitespace or a UTF-8 BOM) by "MSH" starts a
+# new message. A <VT> followed by anything else is just a stray byte in the content.
+_NEW_MESSAGE_START = re.compile(rb"\x0b(?=\s*(?:\xef\xbb\xbf)?\s*MSH)")
 
 
 class FramingError(Exception):
@@ -58,3 +63,21 @@ async def read_frame(reader: asyncio.StreamReader) -> bytes | None:
         level = logging.DEBUG if not noise.strip() else logging.WARNING
         log.log(level, "skipped %d bytes before the frame start: %r", len(noise), noise[:40])
     return block[start + 1 : -len(END_BLOCK)]
+
+
+def split_abandoned(payload: bytes) -> tuple[bytes, bytes]:
+    """Separate frames the sender abandoned from the message that follows them.
+
+    `read_frame` keeps every byte from the first <VT>, so that a stray <VT> inside a
+    message can't cut it short. But when a later <VT> starts a new MSH, the sender gave
+    up on what came before (it never sent the end marker) and started over. Return
+    `(abandoned, message)`: `abandoned` is everything before the last such <VT> (b"" if
+    there is none) and `message` is what follows it. The abandoned part was never
+    completed, so the sender gets no reply for it and resends it if it was real.
+    """
+    last = None
+    for last in _NEW_MESSAGE_START.finditer(payload):
+        pass
+    if last is None:
+        return b"", payload
+    return payload[: last.start()], payload[last.end() :]

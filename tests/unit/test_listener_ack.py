@@ -330,3 +330,36 @@ def test_vt_byte_inside_a_message_is_stored_whole_and_acked_correctly(store, pub
     assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
     [event] = publisher.events
     assert store.load_raw(event["raw_key"]) == msg
+
+
+@pytest.mark.parametrize(
+    "before",
+    [
+        b"\x0bMSH|partial",
+        b"\x0bPING\r\n",
+        b"\x0bMSH|^~\\&|SIMHOSP|SYNTH_GEN",
+        b"\x0bMSH|^~\\&|SIMHOSP|SYNTH_GENERAL|CDP|CDP|20261120225047||ADT^A01|OLD0001|P|2.5.1\rPID|||SY",
+    ],
+    ids=["partial-msh", "noise-with-vt", "cut-inside-msh", "cut-after-msh"],
+)
+def test_message_after_an_abandoned_frame_gets_its_own_aa(store, publisher, rejected, before):
+    """Regression: the sender started a frame, gave up, then sent a valid message on the
+    same connection. The valid message must be stored whole and get its own AA. It
+    previously got AR (or an ACK for the fragment's control ID) and never got through."""
+
+    async def body(reader, writer):
+        writer.write(before + frame(MSG))
+        ack = await asyncio.wait_for(read_frame(reader), 5)
+        # Only one reply: the abandoned fragment was never completed, so it gets none.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(read_frame(reader), 0.3)
+        return ack
+
+    ack = run_with_listener(store, publisher, body, rejected)
+    assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
+    [event] = publisher.events
+    assert store.load_raw(event["raw_key"]) == MSG
+    # The fragment is kept as evidence, minus its <VT> framing byte, and never queued.
+    [saved] = rejected.saved
+    assert rejected.load_raw(saved.key) == before[1:]
+    assert saved.meta["header_error"].startswith("abandoned partial frame")

@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from services.listener.framing import FramingError, FrameTooLarge, read_frame
+from services.listener.framing import FramingError, FrameTooLarge, read_frame, split_abandoned
 
 VT, FS_CR = b"\x0b", b"\x1c\r"
 # Segments end in \r; \xe9 is not valid UTF-8. Both must come through unchanged.
@@ -79,11 +79,43 @@ def test_vt_byte_inside_payload_is_kept():
 
 def test_abandoned_partial_frame_is_kept_with_the_next_frame():
     # The sender started a frame, gave up without an end marker, then sent a full one.
-    # Both land in one block. We keep all of it (nothing is ever thrown away); the
-    # parser will quarantine it, and the sender resends its real message because the
-    # ACK echoes the partial frame's control ID, not the one it is waiting for.
+    # Both land in one block, and read_frame keeps every byte of it. The listener then
+    # separates the abandoned part from the real message with split_abandoned (below).
     data = VT + b"MSH|partial" + frame(MSG_B)
     assert read_all([data]) == [b"MSH|partial" + VT + MSG_B, None]
+
+
+# --- splitting off abandoned frames ------------------------------------------------
+
+
+def test_split_leaves_a_normal_message_alone():
+    assert split_abandoned(MSG_A) == (b"", MSG_A)
+
+
+def test_split_leaves_a_vt_inside_the_message_alone():
+    # A <VT> not followed by MSH is just a stray byte in the content: keep it.
+    payload = MSG_B + b"OBX|2|TX|NOTE||line one\x0bline two\r"
+    assert split_abandoned(payload) == (b"", payload)
+
+
+@pytest.mark.parametrize(
+    "abandoned",
+    [b"MSH|partial", b"PING\r\n", MSG_A[:30], MSG_A + b"PID|||SY"],
+    ids=["partial-msh", "noise", "cut-inside-msh", "cut-after-msh"],
+)
+def test_split_separates_an_abandoned_frame_from_the_new_message(abandoned):
+    assert split_abandoned(abandoned + VT + MSG_B) == (abandoned, MSG_B)
+
+
+def test_split_keeps_everything_before_the_last_restart():
+    # Two abandoned attempts, then the real message.
+    payload = b"MSH|first" + VT + b"MSH|second" + VT + MSG_B
+    assert split_abandoned(payload) == (b"MSH|first" + VT + b"MSH|second", MSG_B)
+
+
+def test_split_allows_whitespace_or_bom_before_the_new_msh():
+    for gap in (b"\r\n", b" ", b"\xef\xbb\xbf"):
+        assert split_abandoned(b"MSH|partial" + VT + gap + MSG_B) == (b"MSH|partial", gap + MSG_B)
 
 
 def test_block_without_start_byte_is_an_error_but_stream_stays_usable():

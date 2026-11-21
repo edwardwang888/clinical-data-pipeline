@@ -84,7 +84,10 @@ Every injected change is logged so checks can be scored against what was actuall
 - Async TCP server (python-hl7 `hl7.mllp`) on port 2575.
 - For each message:
   1. Read the frame (`0x0B` … `0x1C 0x0D`). Bytes before the `0x0B` (e.g. a newline some
-     senders put between frames) are skipped, not treated as a broken frame.
+     senders put between frames) are skipped, not treated as a broken frame. A later
+     `0x0B` inside the frame is kept as content, unless it starts a new `MSH`: then the
+     sender abandoned the earlier frame, so that part is kept in `data/rejected/` as
+     evidence with no reply, and only the new message is processed.
   2. Write the exact bytes plus metadata to the raw archive.
   3. Publish a "new message" event to the queue.
   4. Send ACK `AA` only after steps 2–3 succeed. If either fails, send `AE` so the
@@ -219,6 +222,8 @@ Every injected change is logged so checks can be scored against what was actuall
 | Redis down or publish fails | Listener sends `AE`; sender resends; the orphan raw file is a harmless duplicate |
 | Redis restarts | AOF with fsync on every write keeps already-ACKed events |
 | Stray bytes between frames | Skipped before the `0x0B`; the message itself is kept |
+| Abandoned partial frame (a new `0x0B` + `MSH` before the end marker) | The fragment is kept in `data/rejected/` with no reply; the new message is stored and ACKed on its own |
+| Stray `0x0B` inside a message | Kept as content (it doesn't start a new `MSH`); the message is stored whole |
 | Consumer falls behind | Lag alert; pending messages redelivered |
 
 ## Local stack

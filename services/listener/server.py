@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pipeline.publisher import Publisher
 from pipeline.raw_store import RawStore, safe_segment
 from services.listener.ack import build_ack
-from services.listener.framing import FramingError, FrameTooLarge, read_frame
+from services.listener.framing import FramingError, FrameTooLarge, read_frame, split_abandoned
 from services.listener.msh import MshHeader, read_msh
 
 log = logging.getLogger(__name__)
@@ -63,6 +63,12 @@ class Listener:
                 if raw is None:
                     break  # sender closed the connection
 
+                # If the sender abandoned a frame and started a new one, handle the new
+                # message on its own; the abandoned part is kept as evidence, no reply.
+                abandoned, raw = split_abandoned(raw)
+                if abandoned:
+                    await self._keep_abandoned(abandoned, peer)
+
                 ack = await self.handle_message(raw, peer)
                 writer.writeblock(ack)
                 await writer.drain()
@@ -88,19 +94,7 @@ class Listener:
         """
         received_at = datetime.now(timezone.utc)
         header = read_msh(raw)
-
-        meta = {
-            "received_at": received_at,
-            "hospital": safe_segment(header.facility_id),
-            "feed": safe_segment(header.message_code),
-            "peer": peer,
-            "sending_facility": header.sending_facility,
-            "message_type": header.message_type,
-            "control_id": header.control_id,
-            "header_error": header.error,
-            "source_system": SOURCE_SYSTEM,
-            "listener_version": LISTENER_VERSION,
-        }
+        meta = _metadata(header, received_at, peer)
         if header.error:
             return await self._reject(raw, header, meta, peer)
 
@@ -146,12 +140,44 @@ class Listener:
         log.warning("rejected (AR) peer=%s reason=%s evidence=%s", peer, header.error, saved.key)
         return build_ack(header, "AR", text=f"rejected: {header.error}")
 
+    async def _keep_abandoned(self, fragment: bytes, peer: str) -> None:
+        """Keep the bytes of a frame the sender abandoned, as evidence. No reply.
+
+        The sender never finished this frame, so it isn't waiting for an answer to it,
+        and it will resend the message if it was real. A failure to save the evidence is
+        only logged: it must never hold up the complete message that follows.
+        """
+        meta = _metadata(read_msh(fragment), datetime.now(timezone.utc), peer)
+        meta["header_error"] = "abandoned partial frame: the sender started a new frame before finishing this one"
+        try:
+            saved = await asyncio.to_thread(self.rejected_store.save_raw, fragment, meta)
+        except Exception:
+            log.exception("could not keep abandoned frame peer=%s (%d bytes)", peer, len(fragment))
+            return
+        log.warning("abandoned partial frame peer=%s bytes=%d evidence=%s", peer, len(fragment), saved.key)
+
     async def close_connections(self) -> None:
         """Stop serving open connections (used on shutdown). In-flight messages that
         were not ACKed yet will be resent by their senders."""
         for task in list(self._connections):
             task.cancel()
         await asyncio.gather(*self._connections, return_exceptions=True)
+
+
+def _metadata(header: MshHeader, received_at: datetime, peer: str) -> dict:
+    """What we record next to every stored message (raw or rejected)."""
+    return {
+        "received_at": received_at,
+        "hospital": safe_segment(header.facility_id),
+        "feed": safe_segment(header.message_code),
+        "peer": peer,
+        "sending_facility": header.sending_facility,
+        "message_type": header.message_type,
+        "control_id": header.control_id,
+        "header_error": header.error,
+        "source_system": SOURCE_SYSTEM,
+        "listener_version": LISTENER_VERSION,
+    }
 
 
 def _format_peer(peername) -> str:
