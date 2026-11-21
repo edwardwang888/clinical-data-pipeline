@@ -71,17 +71,67 @@ tests/                 unit and integration tests
 data/                  local raw archive, DuckDB files (gitignored)
 ```
 
+## Code style
+
+- **Readable over clever.** Write code a learner can follow top to bottom. When a
+  simplification keeps the behaviour identical (the tests prove it), take it.
+- **No `global` or `nonlocal`.** Keep changing state in the object that owns it: a small
+  class, or a `threading.Event` for a stop flag. Module-level names are for constants,
+  loggers and other values that never change after startup.
+- **No test-only behaviour in production code.** No hooks, flags or environment checks
+  that exist only for tests, so nothing in production can trigger them by accident. Tests
+  change behaviour from the outside with `unittest.mock`. When the code under test runs in
+  a child process, patch it in a test-only entry point under `tests/` (see
+  `tests/crashing_listener.py`).
+- **Use established libraries for standard formats and protocols** (python-hl7 for
+  parsing) rather than writing our own. Write our own only where a library's behaviour
+  would break a rule above, and say why in a comment.
+- **Say exactly what happened.** Log lines, ACK texts and error messages must be accurate:
+  "message not queued" when the file was saved but the publish failed, not "not stored".
+- **Survive transient outages.** When a dependency such as Redis is down, wait and retry
+  with a growing delay instead of crashing and relying on Docker to restart the process,
+  and keep responding promptly to a stop request while waiting.
+- **Comments explain why, briefly.** Don't restate the code, and don't copy rules from
+  `AGENTS.md` or `DESIGN.md` into docstrings, where they drift; point to them instead.
+
+## Tests
+
+- **Anything checked by hand becomes a test:** killing Redis, stopping a container,
+  crashing at a particular step.
+- **Extend an existing test before writing a parallel one.** If the setup is the same, add
+  a parametrized case (as the restart test does for its five ways of going down).
+- **Use real processes and real Redis where the behaviour depends on them** (crashes,
+  signals, outages). Use fakes in unit tests to pin down exact ordering and failures.
+- **Make timing-dependent tests reliable.** Trigger events on progress (after N ACKs),
+  not on sleeps; assert what must always hold, not exact counts.
+- **A new test must be able to fail.** Break the behaviour it covers once and check that
+  it fails.
+- **Keep tests readable:** shared helpers and fixtures instead of repeated setup, and
+  names that say what is checked.
+
 ## How to work
 
 - Build one milestone from the `DESIGN.md` build plan at a time, on its own branch, and
   open a PR for each. Small, focused commits.
+- **Keep PRs small.** A milestone can be several PRs. Put follow-ups in their own PR, and
+  before adding to an open PR, say roughly how many lines the change adds.
 - Each milestone needs tests, including the failure modes it touches (see the
   "Failure modes" table in `DESIGN.md`).
 - Prefer the simplest thing that is correct. Add a dependency only when it clearly earns
-  its place, and say why in the PR.
+  its place, and say why in the PR. When adding or upgrading a dependency or base image,
+  check it for known CVEs, and pin downloads by hash where possible.
 - If something in `DESIGN.md` turns out to be wrong or impractical, stop and explain the
   problem and options before changing direction.
 - Keep the `README.md` current: what runs, how to start it, how to run tests.
+- **Review before a PR is ready.** Have an independent adversarial review done (for example
+  by a subagent):
+  - Post its findings as a PR comment before fixing anything.
+  - Confirm each blocker yourself, then fix it with a test that fails without the fix.
+  - List the non-blockers in the comment for later; don't fix them unless asked.
+- Keep the PR description up to date as the PR changes.
+- **Commits:** author and committer are the repository owner, using their private GitHub
+  email (the `users.noreply.github.com` address), never a personal one. Add a
+  `Co-authored-by:` trailer naming the agent that actually did the work.
 
 ## After each milestone
 
