@@ -46,9 +46,11 @@ async def read_frame(reader: asyncio.StreamReader) -> bytes | None:
     except asyncio.LimitOverrunError as e:
         raise FrameTooLarge(f"frame larger than the {e.consumed}+ byte limit") from e
 
-    # Use the *last* <VT>: anything before it is noise, or the start of an earlier
-    # frame that was abandoned without an end marker (never ACKed, so it gets resent).
-    start = block.rfind(START_BLOCK)
+    # The frame starts at the *first* <VT>; only bytes before it are noise. A later
+    # <VT> stays in the payload: it may be a stray byte inside the message, or an
+    # abandoned partial frame followed by a new one. Either way we keep every byte,
+    # because cutting there would store a fragment and still ACK it as the message.
+    start = block.find(START_BLOCK)
     if start == -1:
         raise FramingError(f"{len(block)} bytes ended with <FS><CR> but had no <VT> start byte")
     if start > 0:

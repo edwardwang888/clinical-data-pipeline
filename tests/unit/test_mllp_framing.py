@@ -69,10 +69,21 @@ def test_newline_between_frames_is_tolerated():
     assert read_all([frame(MSG_A) + b"\n" + frame(MSG_B) + b"\n"]) == [MSG_A, MSG_B, None]
 
 
-def test_abandoned_partial_frame_is_skipped_in_favour_of_the_new_one():
+def test_vt_byte_inside_payload_is_kept():
+    # MLLP content shouldn't contain <VT>, but if it does (e.g. a stray control
+    # character in free text) we must keep every byte. Cutting at that <VT> would
+    # store only the tail and still ACK it.
+    payload = b"MSH|^~\\&|A|SYNTH_GENERAL|||20261120||ORU^R01|C1|P|2.5.1\rOBX|1|TX|NOTE||line one\x0bline two\r"
+    assert read_all([frame(payload)]) == [payload, None]
+
+
+def test_abandoned_partial_frame_is_kept_with_the_next_frame():
     # The sender started a frame, gave up without an end marker, then sent a full one.
+    # Both land in one block. We keep all of it (nothing is ever thrown away); the
+    # parser will quarantine it, and the sender resends its real message because the
+    # ACK echoes the partial frame's control ID, not the one it is waiting for.
     data = VT + b"MSH|partial" + frame(MSG_B)
-    assert read_all([data]) == [MSG_B, None]
+    assert read_all([data]) == [b"MSH|partial" + VT + MSG_B, None]
 
 
 def test_block_without_start_byte_is_an_error_but_stream_stays_usable():

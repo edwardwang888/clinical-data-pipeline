@@ -237,3 +237,18 @@ def test_event_points_at_the_exact_raw_bytes(store, publisher):
     assert event["feed"] == "adt"
     assert event["control_id"] == "CTRL0001"
     assert event["source_system"] == "hl7v2"
+
+
+def test_vt_byte_inside_a_message_is_stored_whole_and_acked_correctly(store, publisher):
+    """Regression: a stray 0x0B in free text must not cut the message. Previously only
+    the bytes after it were stored, and the AA had an empty control ID."""
+    msg = MSG + b"OBX|1|TX|NOTE||line one\x0bline two\r"
+
+    async def body(reader, writer):
+        writer.write(frame(msg))
+        return await asyncio.wait_for(read_frame(reader), 5)
+
+    ack = run_with_listener(store, publisher, body)
+    assert msa(ack)[:3] == ["MSA", "AA", "CTRL0001"]
+    [event] = publisher.events
+    assert store.load_raw(event["raw_key"]) == msg
