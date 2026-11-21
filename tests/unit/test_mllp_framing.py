@@ -192,3 +192,19 @@ def test_oversized_frame_hands_back_what_was_received():
     assert "size limit" in b.reason
     assert b.kind == "too_large"
 
+
+
+# Python's bytes.strip() also treats 0x0B (our frame start) and 0x0C as whitespace. Only
+# space, tab, CR and LF are harmless between frames; anything else must be reported.
+
+
+def test_lone_start_byte_before_a_disconnect_is_reported():
+    [block] = read_blocks([VT])
+    assert block.end_of_stream
+    assert (block.discarded, block.kind) == (VT, "cut_off_by_disconnect")
+
+
+def test_form_feed_before_a_frame_is_reported_as_noise():
+    [block, _end] = read_blocks([b"\x0c" + frame(MSG_A)])
+    assert block.payload == MSG_A
+    assert (block.discarded, block.kind) == (b"\x0c", "noise_before_frame")

@@ -17,6 +17,9 @@ from dataclasses import dataclass
 
 START_BLOCK = b"\x0b"  # <VT>
 END_BLOCK = b"\x1c\x0d"  # <FS><CR>
+# Harmless between frames. Not bytes.strip()'s default set, which also includes 0x0B
+# (our frame start) and 0x0C: those must be reported, not silently skipped.
+WHITESPACE = b" \t\r\n"
 
 # A <VT> that is followed (after optional whitespace or a UTF-8 BOM) by "MSH" starts a
 # new message. A <VT> followed by anything else is just a stray byte in the content.
@@ -48,7 +51,7 @@ async def read_block(reader: asyncio.StreamReader) -> Block:
     except asyncio.IncompleteReadError as e:
         # The connection ended. Leftover bytes are a frame that was never completed (so
         # never ACKed; the sender resends it if it was real).
-        if not e.partial.strip():
+        if not e.partial.strip(WHITESPACE):
             return Block(None, end_of_stream=True)  # clean close (whitespace at most)
         return Block(None, e.partial, "connection closed mid-frame", "cut_off_by_disconnect", end_of_stream=True)
     except asyncio.LimitOverrunError as e:
@@ -66,7 +69,7 @@ async def read_block(reader: asyncio.StreamReader) -> Block:
     if start == -1:
         return Block(None, block, "block ended with <FS><CR> but had no <VT> start byte", "no_start_byte")
     noise = block[:start]
-    if noise.strip():
+    if noise.strip(WHITESPACE):
         return Block(block[start + 1 : -len(END_BLOCK)], noise, "bytes before the frame start", "noise_before_frame")
     return Block(block[start + 1 : -len(END_BLOCK)])
 
