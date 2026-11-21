@@ -100,13 +100,13 @@ class RawEventConsumer:
                 return handled
             start = next_start
 
-    def process_new(self, block_ms: int | None = 5000) -> int:
+    def process_new(self, block_ms: int | None = 1000) -> int:
         """Handle events never delivered to anyone yet (waits up to `block_ms`)."""
         return self._handle(self._read(">", block_ms))
 
     def run_forever(
         self,
-        block_ms: int = 5000,
+        block_ms: int = 1000,  # also how long a stop request can wait to be noticed
         should_stop: Callable[[], bool] = lambda: False,
         retry_delay: float = 0.5,
         max_retry_delay: float = 10.0,
