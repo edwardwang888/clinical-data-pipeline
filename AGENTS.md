@@ -19,14 +19,18 @@ in the same PR (especially the "Key decisions and trade-offs" and "Failure modes
 - **Never ACK before the message is durably stored.** The listener sends `AA` only after
   the raw write and the queue publish both succeed.
 - **The listener does not parse.** It reads only the MSH fields it needs for the ACK and
-  file metadata, and must still store the message if even that fails.
+  file metadata. If it can't read those (no MSH, control ID or message type), it keeps the
+  exact bytes as evidence in the rejected area, never queues them, and replies `AR`;
+  rejections, too, are sent only after the bytes are stored. Anything with a readable
+  header is stored and ACKed, however wrong its contents.
 - **The raw archive is append-only.** Create-only writes, unique file names, never
   overwrite or edit. Store exact bytes (segments end in `\r`; don't normalize line endings
   or decode/re-encode).
 - **Consumers are idempotent and order-independent.** Delivery is at least once and
   unordered; processing the same message twice or out of order must give the same result.
-- **Bad data never blocks the pipeline.** Unparseable messages go to quarantine with the
-  error and a pointer to the raw file.
+- **Bad data never blocks the pipeline.** Messages with a readable header but bad contents
+  go to quarantine with the error and a pointer to the raw file; they are never rejected
+  at the door, so they can't stall the sender's queue.
 - **Lineage everywhere.** Every derived row keeps `raw_message_id` (sha256 of raw bytes)
   and `source_system`.
 

@@ -89,10 +89,17 @@ Every injected change is logged so checks can be scored against what was actuall
   3. Publish a "new message" event to the queue.
   4. Send ACK `AA` only after steps 2–3 succeed. If either fails, send `AE` so the
      sender resends (a raw file without an event is just a future duplicate).
-- **No parsing before the ACK.** A message that can't be parsed must not block the feed;
-  it gets quarantined downstream.
+- **No parsing before the ACK.** A message with bad contents must not block the feed:
+  it is stored, ACKed and quarantined downstream.
 - Read only the minimum header fields needed for the file name and metadata (sending
-  facility, message type, control ID), and tolerate even those failing.
+  facility, message type, control ID). A leading UTF-8 byte-order mark is skipped for
+  reading only.
+- **Unidentifiable messages are rejected.** If even those header fields can't be read (no
+  MSH, control ID or message type), there is nothing to match an ACK to and nothing to
+  queue. Keep the exact bytes as evidence in `data/rejected/` (same layout as the raw
+  archive, never queued), then reply `AR` with the reason. If saving the evidence fails,
+  reply `AE` so the sender retries. This matches Google's HL7v2 store, which rejects
+  messages without a header but can store and flag content errors (`SOFT_FAIL`).
 
 ### 4. Raw archive
 
@@ -185,7 +192,8 @@ Every injected change is logged so checks can be scored against what was actuall
 | Create-only writes | Temp file + fsync + hard link | `open(..., "x")` directly | Never overwrites, and a crash can't leave a truncated file under a real name |
 | Queue durability | Redis AOF, `appendfsync always` | Default snapshots / `everysec` | An ACKed event must survive a Redis restart; the speed cost doesn't matter at this scale |
 | Producer | Python producer now; Simulated Hospital later | Build Simulated Hospital from source now | Its image won't pull and the source needs Bazel; milestone 1 only needs correct MLLP + resend behavior |
-| Frame reading | Own `read_frame` on python-hl7's streams | python-hl7 `readblock()` | `readblock()` drops a whole message if any byte precedes `0x0B` |
+| Frame reading | Own `read_frame` on python-hl7's streams, starting at the first `0x0B` | python-hl7 `readblock()` | `readblock()` drops a whole message if any byte precedes `0x0B` |
+| Malformed messages at intake | `AR` only when the header can't be read (bytes kept as evidence); everything else stored, `AA`, quarantined at parse | Reject every malformed message; or accept everything, even with no header | Rejecting content errors stalls the sender's queue and loses evidence, and our own parser bugs would block their feed. But an `AA` with no control ID is useless to the sender |
 | Triggering processing | Listener publishes to queue | Storage-event notification (GCS → Pub/Sub) | Both are fine; interface keeps it swappable |
 | Parsing | Own parser (python-hl7) | GCP HL7v2 store + HL7→FHIR | Full control over mapping, history and replay |
 | Warehouse | DuckDB + dbt | BigQuery | Free and local; dbt models carry over |
@@ -201,7 +209,9 @@ Every injected change is logged so checks can be scored against what was actuall
 | Patient merge (A40) | Merge table maps old key to surviving key |
 | Unit change | Unit check per lab code alerts; conversion from site config |
 | New local code | Kept and flagged; unmapped-code rate alert |
-| Malformed message | ACKed (it's stored), then quarantined at parse |
+| Malformed message (readable header) | ACKed (it's stored), then quarantined at parse |
+| Unidentifiable message (no MSH, control ID or message type) | Bytes kept in `data/rejected/`, never queued; `AR` with the reason |
+| Saving rejected evidence fails | `AE`, so the sender retries |
 | Feed goes silent | Freshness alert per feed, aware of time of day |
 | Burst after downtime | Queue absorbs it; listener only stores and ACKs |
 | Listener crashes mid-message | No ACK sent, so the sender retries; duplicates handled downstream |
