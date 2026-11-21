@@ -64,18 +64,17 @@ class MllpSender:
                 await self._writer.drain()
                 ack = await asyncio.wait_for(self._reader.readblock(), self.ack_timeout)
                 code, acked_id = read_ack(ack)
+            except Exception as e:
+                # Connection refused/reset, ACK timeout, connection closed before the
+                # ACK, or an ACK we can't read: all mean "not acknowledged", so resend.
+                problem = f"{type(e).__name__}: {e}"
+            else:
                 if code == "AA" and acked_id == control_id:
                     return attempt
                 if code == "AR":
                     # Rejected: resending the same bytes won't help.
                     raise SendFailed(f"{control_id} rejected (AR)")
                 problem = f"got {code} for {acked_id!r}"
-            except SendFailed:
-                raise
-            except Exception as e:
-                # Connection refused/reset, ACK timeout, connection closed before the
-                # ACK, or an ACK we can't read: all mean "not acknowledged", so resend.
-                problem = f"{type(e).__name__}: {e}"
 
             # Anything other than a matching AA: start again on a fresh connection, so a
             # late ACK for this attempt can't be mistaken for the next one.

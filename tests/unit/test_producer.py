@@ -9,6 +9,7 @@ from producer.sender import MllpSender, SendFailed
 from services.listener.msh import read_msh
 
 FIXED = datetime(2026, 11, 20, tzinfo=timezone.utc)
+MSG = MessageGenerator(seed=1, run_id="T").next()
 
 
 def test_generated_messages_are_synthetic_and_readable():
@@ -36,9 +37,10 @@ def ack(code: str, control_id: str) -> bytes:
     return f"MSH|^~\\&|CDP|CDP|P|F|20261120||ACK|A1|P|2.5.1\rMSA|{code}|{control_id}\r".encode()
 
 
-def run_against(script, body):
-    """Run a fake receiver that answers connection by connection, message by message,
-    following `script` (a list of actions per received message)."""
+def send_against(script):
+    """Send MSG to a fake receiver that answers each message it receives with the next
+    action in `script` (an ACK code, or "drop" to close without ACKing). Returns the
+    sender's attempt count and the bytes the receiver got."""
     received = []
 
     async def handle(reader, writer):
@@ -60,7 +62,7 @@ def run_against(script, body):
         port = server.sockets[0].getsockname()[1]
         sender = MllpSender("127.0.0.1", port, retry_delay=0.01, ack_timeout=2, max_attempts=5)
         try:
-            return await body(sender)
+            return await sender.send(MSG.raw, MSG.control_id)
         finally:
             await sender.close()
             server.close()
@@ -68,32 +70,29 @@ def run_against(script, body):
     return asyncio.run(main()), received
 
 
-MSG = MessageGenerator(seed=1, run_id="T").next()
-
-
 def test_sender_returns_after_aa():
-    attempts, received = run_against(["AA"], lambda s: s.send(MSG.raw, MSG.control_id))
+    attempts, received = send_against(["AA"])
     assert attempts == 1
     assert received == [MSG.raw]
 
 
 def test_sender_resends_after_ae():
-    attempts, received = run_against(["AE", "AA"], lambda s: s.send(MSG.raw, MSG.control_id))
+    attempts, received = send_against(["AE", "AA"])
     assert attempts == 2
     assert received == [MSG.raw, MSG.raw]  # the exact same bytes again
 
 
 def test_sender_resends_when_connection_drops_before_ack():
-    attempts, received = run_against(["drop", "AA"], lambda s: s.send(MSG.raw, MSG.control_id))
+    attempts, received = send_against(["drop", "AA"])
     assert attempts == 2
     assert received == [MSG.raw, MSG.raw]
 
 
 def test_sender_gives_up_on_ar():
     with pytest.raises(SendFailed, match="rejected"):
-        run_against(["AR"], lambda s: s.send(MSG.raw, MSG.control_id))
+        send_against(["AR"])
 
 
 def test_sender_gives_up_after_max_attempts():
     with pytest.raises(SendFailed, match="5 attempts"):
-        run_against(["AE"] * 5, lambda s: s.send(MSG.raw, MSG.control_id))
+        send_against(["AE"] * 5)
