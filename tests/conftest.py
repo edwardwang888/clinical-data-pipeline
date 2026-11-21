@@ -81,8 +81,9 @@ class ListenerProcess:
     """The real listener (`python -m services.listener`) as a child process, writing to
     `data_dir`/raw and `data_dir`/rejected, with its log in `data_dir`/listener.log."""
 
-    def __init__(self, port, data_dir, redis_url, stream, extra_env=None):
+    def __init__(self, port, data_dir, redis_url, stream, extra_env=None, module="services.listener"):
         self.port = port
+        self.module = module
         self.raw_dir = data_dir / "raw"
         self.rejected_dir = data_dir / "rejected"
         self.log_path = data_dir / "listener.log"
@@ -104,7 +105,7 @@ class ListenerProcess:
     def start(self):
         with open(self.log_path, "a") as log:
             self.proc = subprocess.Popen(
-                [sys.executable, "-m", "services.listener"],
+                [sys.executable, "-m", self.module],
                 cwd=REPO_ROOT,
                 env=self.env,
                 stdout=log,

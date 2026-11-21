@@ -88,7 +88,8 @@ This runs the whole suite in a container against the Compose Redis. Without Dock
   restarts it, and checks that every ACKed message has a raw file with its exact bytes
   and a queue event. It goes down five ways: SIGKILL, SIGTERM, and three crashes at an
   exact step (after the file is saved, after the event is published, in the middle of
-  writing a file), triggered by `CRASH_AT` in `pipeline/crash_points.py`.
+  writing a file), by running the listener through `tests/crashing_listener.py`, which
+  patches one function to crash there. Production code has no crash hooks.
 
 ## Layout
 

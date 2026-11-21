@@ -4,7 +4,7 @@ Sends 1,000 messages over 4 concurrent connections to a real listener process, b
 it down partway through, starts it again, and lets the senders resend whatever wasn't
 ACKed. It goes down in five ways: killed from outside (SIGKILL) or stopped cleanly
 (SIGTERM), wherever it happens to be; or crashing by itself at an exact step (see
-pipeline/crash_points.py), so the most dangerous moments are hit on every run.
+tests/crashing_listener.py), so the most dangerous moments are hit on every run.
 
 Then checks the promise: every ACKed message has a raw file with its exact bytes and a
 queue event pointing at such a file. Duplicates are fine; losses are not.
@@ -46,7 +46,8 @@ def test_no_acked_message_is_lost_when_listener_restarts(
     way = WAYS_DOWN[how]
     crash_env = {"CRASH_AT": way["crash_at"], "CRASH_ON": str(CRASH_ON_HIT)} if "crash_at" in way else {}
     port = free_port()
-    listener = ListenerProcess(port, tmp_path, redis_url, stream_name, extra_env=crash_env)
+    module = "tests.crashing_listener" if crash_env else "services.listener"
+    listener = ListenerProcess(port, tmp_path, redis_url, stream_name, extra_env=crash_env, module=module)
     raw_dir = listener.raw_dir
     messages = MessageGenerator(seed=2026, run_id="IT").take(N_MESSAGES)
     sent_bytes = {m.raw for m in messages}
@@ -69,7 +70,7 @@ def test_no_acked_message_is_lost_when_listener_restarts(
             await asyncio.to_thread(listener.stop, way["signal"])
         else:
             await asyncio.to_thread(listener.proc.wait, 120)  # it crashes by itself
-            del listener.env["CRASH_AT"]  # and comes back up normally
+            listener.module = "services.listener"  # and comes back up as the normal listener
         await asyncio.sleep(0.3)  # downtime: senders get "connection refused" and back off
         await asyncio.to_thread(listener.start)
 

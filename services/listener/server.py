@@ -29,7 +29,6 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 
-from pipeline.crash_points import crash_point
 from pipeline.publisher import Publisher
 from pipeline.raw_store import RawStore, SavedRaw, safe_segment
 from services.listener.ack import build_ack
@@ -114,7 +113,6 @@ class Listener:
             # File I/O and the Redis call block, so run them in a worker thread to keep
             # other connections flowing meanwhile.
             saved = await asyncio.to_thread(self.store.save_raw, raw, meta)
-            crash_point("after_save")
             event = {
                 "raw_key": saved.key,
                 "raw_message_id": saved.sha256,
@@ -126,7 +124,6 @@ class Listener:
                 "received_at": received_at.isoformat(),
             }
             event_id = await asyncio.to_thread(self.publisher.publish, event)
-            crash_point("after_publish")
         except Exception:
             log.exception("NOT stored and queued, sending AE peer=%s control_id=%s", peer, header.control_id)
             # The raw file may already be saved; it's the queueing that didn't happen.
