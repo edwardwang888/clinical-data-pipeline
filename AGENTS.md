@@ -31,6 +31,11 @@ in the same PR (especially the "Key decisions and trade-offs" and "Failure modes
 - **Bad data never blocks the pipeline.** Messages with a readable header but bad contents
   go to quarantine with the error and a pointer to the raw file; they are never rejected
   at the door, so they can't stall the sender's queue.
+- **Nothing is dropped silently.** Any bytes the listener can't use as a message (noise
+  before a frame, a block with no start byte, a frame cut off by a disconnect or over the
+  size limit, an abandoned frame) are kept in the rejected area with the reason, and
+  logged. If even that save fails, the log records their size and sha256. Whitespace
+  between frames is the only thing skipped.
 - **Lineage everywhere.** Every derived row keeps `raw_message_id` (sha256 of raw bytes)
   and `source_system`.
 

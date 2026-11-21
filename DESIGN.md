@@ -83,8 +83,9 @@ Every injected change is logged so checks can be scored against what was actuall
 
 - Async TCP server (python-hl7 `hl7.mllp`) on port 2575.
 - For each message:
-  1. Read the frame (`0x0B` … `0x1C 0x0D`). Bytes before the `0x0B` (e.g. a newline some
-     senders put between frames) are skipped, not treated as a broken frame. A later
+  1. Read the frame (`0x0B` … `0x1C 0x0D`). Whitespace before the `0x0B` (e.g. a newline
+     some senders put between frames) is skipped; any other bytes there are kept in
+     `data/rejected/` as evidence, and the frame itself is processed normally. A later
      `0x0B` inside the frame is kept as content, unless it starts a new `MSH`: then the
      sender abandoned the earlier frame, so that part is kept in `data/rejected/` as
      evidence with no reply, and only the new message is processed.
@@ -221,7 +222,11 @@ Every injected change is logged so checks can be scored against what was actuall
 | Listener crashes mid-write | Temp file + hard link: no truncated file under a final name; stray `.tmp-*` files are harmless |
 | Redis down or publish fails | Listener sends `AE`; sender resends; the orphan raw file is a harmless duplicate |
 | Redis restarts | AOF with fsync on every write keeps already-ACKed events |
-| Stray bytes between frames | Skipped before the `0x0B`; the message itself is kept |
+| Stray bytes between frames | Whitespace is skipped; anything else is kept in `data/rejected/` with the reason. The message after it is processed normally |
+| Block with an end marker but no `0x0B` | Kept whole in `data/rejected/` with the reason; no reply (it isn't a frame). The stream stays in sync for the next frame |
+| Connection closed mid-frame | The incomplete bytes are kept in `data/rejected/`; never ACKed, so the sender resends |
+| Frame over the size limit (`MAX_MESSAGE_BYTES`) | The bytes received so far are kept in `data/rejected/`, then the connection is closed (the next frame boundary can't be found reliably) |
+| Saving evidence to `data/rejected/` fails | Logged with the bytes' size and sha256; never holds up the messages around it (for an unidentifiable message, the sender gets `AE` and resends) |
 | Abandoned partial frame (a new `0x0B` + `MSH` before the end marker) | The fragment is kept in `data/rejected/` with no reply; the new message is stored and ACKed on its own |
 | Stray `0x0B` inside a message | Kept as content (it doesn't start a new `MSH`); the message is stored whole |
 | HL7 batch in one frame (`FHS`/`BHS` instead of `MSH`) | Out of scope for now: gets `AR`, bytes kept in `data/rejected/`. Real-time MLLP feeds send single messages; batches mostly arrive as files |
