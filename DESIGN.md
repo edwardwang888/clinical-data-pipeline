@@ -229,6 +229,7 @@ Every injected change is logged so checks can be scored against what was actuall
 | Listener crashes mid-message | No ACK sent, so the sender retries; duplicates handled downstream |
 | Listener crashes mid-write | Temp file + hard link: no truncated file under a final name; stray `.tmp-*` files are harmless |
 | Redis down or publish fails | Listener sends `AE`; sender resends; the orphan raw file is a harmless duplicate |
+| Redis down (consumer side) | The consumer waits and retries with a growing delay (up to 10 s) instead of crashing; once Redis is back it first re-reads its own pending events, then carries on |
 | Redis restarts | AOF with fsync on every write keeps already-ACKed events |
 | Stray bytes between frames | Whitespace is skipped; anything else is kept in `data/rejected/` with the reason. The message after it is processed normally |
 | Block with an end marker but no `0x0B` | Kept whole in `data/rejected/` with the reason; no reply (it isn't a frame). The stream stays in sync for the next frame |
