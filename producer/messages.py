@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import random
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -59,12 +58,10 @@ class MessageGenerator:
         seed: int | None = None,
         run_id: str | None = None,
         facility: str = FACILITY,
-        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.rng = random.Random(seed)
         self.run_id = run_id or uuid.uuid4().hex[:8].upper()
         self.facility = facility
-        self.clock = clock
         self.seq = 0
         self.admitted: list[_Patient] = []
         self.next_mrn = self.rng.randrange(100000, 900000)
@@ -143,7 +140,7 @@ class MessageGenerator:
         return f"PID|1||{p.mrn}^^^{self.facility}^MR||{p.last}^{p.first}||{p.birth_date}|{p.sex}"
 
     def _ts(self) -> str:
-        return f"{self.clock().astimezone(timezone.utc):%Y%m%d%H%M%S}+0000"
+        return f"{datetime.now(timezone.utc):%Y%m%d%H%M%S}+0000"
 
 
 def _encode(segments: list[str]) -> bytes:

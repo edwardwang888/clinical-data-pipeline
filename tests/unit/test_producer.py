@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from unittest import mock
 
 import pytest
 from hl7.mllp import start_hl7_server
@@ -28,8 +29,12 @@ def test_generated_messages_are_synthetic_and_readable():
 
 
 def test_same_seed_same_content():
-    a = MessageGenerator(seed=7, run_id="X", clock=lambda: FIXED).take(20)
-    b = MessageGenerator(seed=7, run_id="X", clock=lambda: FIXED).take(20)
+    # Freeze the clock, so only the seed decides the content.
+    with mock.patch("producer.messages.datetime") as frozen:
+        frozen.now.return_value = FIXED
+        a = MessageGenerator(seed=7, run_id="X").take(20)
+        b = MessageGenerator(seed=7, run_id="X").take(20)
+    assert b"|20261120000000+0000|" in a[0].raw  # the frozen time was used
     assert [m.raw for m in a] == [m.raw for m in b]
 
 
