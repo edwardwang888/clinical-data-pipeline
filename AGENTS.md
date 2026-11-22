@@ -78,13 +78,12 @@ data/                  local raw archive, DuckDB files (gitignored)
 - **No `global` or `nonlocal`.** Keep changing state in the object that owns it: a small
   class, or a `threading.Event` for a stop flag. Module-level names are for constants,
   loggers and other values that never change after startup.
-- **No test-only behaviour in production code.** No hooks, flags or environment checks
-  that exist only for tests, so nothing in production can trigger them by accident. That
-  includes parameters only tests pass, such as an injectable `sleep` to skip real waits:
-  patch the function instead (the consumer tests patch `pipeline.consumer._wait`). Tests
-  change behaviour from the outside with `unittest.mock`. When the code under test runs in
-  a child process, patch it in a test-only entry point under `tests/` (see
-  `tests/crashing_listener.py`).
+- **No test-only behaviour in production code.** No hooks, flags, environment checks or
+  parameters that exist only for tests (for example, to skip real waits or to fix the
+  clock), so nothing in production can trigger them by accident. Tests change behaviour
+  from the outside: patch the function or module attribute with `unittest.mock`. When the
+  code under test runs in a child process, patch it in a test-only entry point under
+  `tests/` (see `tests/crashing_listener.py`).
 - **Use established libraries for standard formats and protocols** (python-hl7 for
   parsing) rather than writing our own. Write our own only where a library's behaviour
   would break a rule above, and say why in a comment.
