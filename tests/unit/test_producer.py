@@ -1,7 +1,9 @@
 import asyncio
+import re
 from datetime import datetime, timezone
 from unittest import mock
 
+import hl7
 import pytest
 from hl7.mllp import start_hl7_server
 
@@ -25,7 +27,8 @@ def test_generated_messages_are_synthetic_and_readable():
         assert header.error is None
         assert header.control_id == m.control_id
         assert header.facility_id == "SYNTH_GENERAL"
-        assert b"|SYN" in m.raw  # MRNs are clearly synthetic
+        mrn = str(hl7.parse(m.raw.decode("ascii"))["PID.F3.R1.C1"])
+        assert re.fullmatch(r"SYN\d{6}", mrn)  # MRNs are clearly synthetic
 
 
 def test_same_seed_same_content():
