@@ -81,6 +81,12 @@ This runs the whole suite in a container against the Compose Redis. Without Dock
 `make test-local` (needs [uv](https://docs.astral.sh/uv/); the Redis tests also need
 `redis-server` on your PATH, otherwise they are skipped).
 
+To check the code with ruff (needs uv; the rules are in `pyproject.toml`):
+
+```bash
+make lint
+```
+
 - `tests/unit/`: MLLP framing, MSH header reading and ACKs, raw file naming and
   create-only writes, the "ACK only after save and publish" rule, and producer resends.
 - `tests/integration/`: the consumer against real Redis, and the milestone test. That test
