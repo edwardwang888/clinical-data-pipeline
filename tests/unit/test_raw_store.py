@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 import pytest
 
@@ -87,6 +89,38 @@ def test_save_keeps_exact_bytes_and_writes_metadata(tmp_path):
 def test_save_leaves_no_temp_files(tmp_path):
     LocalRawStore(tmp_path).save_raw(RAW, meta())
     assert not [p for p in tmp_path.rglob("*") if p.name.startswith(".tmp-")]
+
+
+def test_save_fsyncs_each_file_before_naming_it_and_each_directory_before_returning(tmp_path):
+    # Crash tests can't catch a missing fsync: a killed process loses nothing that the OS
+    # already has in its cache. So record the calls, identifying files and directories by
+    # inode (a temp file and its final name share one), and check their order.
+    calls = []
+    real_fsync, real_link = os.fsync, os.link
+
+    def fsync(fd):
+        calls.append(("fsync", os.fstat(fd).st_ino))
+        real_fsync(fd)
+
+    def link(src, dst):
+        calls.append(("link", os.stat(src).st_ino))
+        real_link(src, dst)
+
+    with mock.patch("os.fsync", side_effect=fsync), mock.patch("os.link", side_effect=link):
+        saved = LocalRawStore(tmp_path).save_raw(RAW, meta())
+
+    hl7_path = tmp_path / saved.key
+    files = [hl7_path, hl7_path.with_suffix(".json")]
+    for f in files:  # each file's data is on disk before its name appears
+        inode = f.stat().st_ino
+        assert calls.index(("fsync", inode)) < calls.index(("link", inode)), f.name
+    # The new names themselves are made durable before save_raw returns...
+    last_link = max(calls.index(("link", f.stat().st_ino)) for f in files)
+    assert ("fsync", hl7_path.parent.stat().st_ino) in calls[last_link:]
+    # ...and so is each new directory, in its parent (hospital=, feed=, date=).
+    new_dirs = [hl7_path.parent, hl7_path.parent.parent, hl7_path.parent.parent.parent]
+    for d in new_dirs:
+        assert ("fsync", d.parent.stat().st_ino) in calls, d.name
 
 
 def test_same_message_twice_becomes_two_files(tmp_path):
