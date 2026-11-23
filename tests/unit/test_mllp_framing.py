@@ -1,8 +1,11 @@
 import asyncio
+import subprocess
+import sys
 
 import pytest
 
 from services.listener.framing import read_block, split_abandoned
+from tests.conftest import REPO_ROOT
 
 VT, FS_CR = b"\x0b", b"\x1c\r"
 # Segments end in \r; \xe9 is not valid UTF-8. Both must come through unchanged.
@@ -208,3 +211,16 @@ def test_form_feed_before_a_frame_is_reported_as_noise():
     [block, _end] = read_blocks([b"\x0c" + frame(MSG_A)])
     assert block.payload == MSG_A
     assert (block.discarded, block.kind) == (b"\x0c", "noise_before_frame")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ['b"\\x0b" * 20_000', 'b"\\x0b" + b" " * 200_000', '(b"\\x0b" + b" \\r\\n") * 5_000'],
+    ids=["start-bytes", "long-whitespace", "repeated-start-and-whitespace"],
+)
+def test_split_abandoned_stays_fast_on_hostile_input(payload):
+    # The listener runs this on the event loop, so a slow (backtracking) regex would stall
+    # every connection. Run it in a child process, so a regression times out instead of
+    # hanging the test run (the regex engine holds the interpreter while it backtracks).
+    code = f"from services.listener.framing import split_abandoned; split_abandoned({payload})"
+    subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, timeout=5, check=True)

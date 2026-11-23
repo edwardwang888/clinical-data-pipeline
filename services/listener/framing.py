@@ -23,7 +23,11 @@ WHITESPACE = b" \t\r\n"
 
 # A <VT> that is followed (after optional whitespace or a UTF-8 BOM) by "MSH" starts a
 # new message. A <VT> followed by anything else is just a stray byte in the content.
-_NEW_MESSAGE_START = re.compile(rb"\x0b(?=\s*(?:\xef\xbb\xbf)?\s*MSH)")
+# The whitespace is the same set as WHITESPACE, not `\s` (which also matches 0x0B and
+# 0x0C). And each byte can be matched only one way, so this runs in linear time: it is
+# applied to untrusted frames on the event loop, where a pattern that backtracks would
+# stall every connection.
+_NEW_MESSAGE_START = re.compile(rb"\x0b(?=[ \t\r\n]*(?:\xef\xbb\xbf[ \t\r\n]*)?MSH)")
 
 
 @dataclass(frozen=True)
