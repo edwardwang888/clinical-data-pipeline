@@ -51,7 +51,7 @@ in the same PR (especially the "Key decisions and trade-offs" and "Failure modes
 - DuckDB + dbt (duckdb adapter) for staging and models
 - FastAPI for the read API
 - Docker Compose to run everything; a `Makefile` with `up`, `down`, `logs`, `test`
-- pytest for tests
+- pytest for tests; ruff for linting (`make lint`, rules in `pyproject.toml`)
 
 Storage and queue access go through small interfaces (`RawStore.save_raw(bytes, meta)`,
 `Publisher.publish(event)`) so GCS and Pub/Sub can be swapped in later without touching
@@ -92,6 +92,11 @@ data/                  local raw archive, DuckDB files (gitignored)
 - **Survive transient outages.** When a dependency such as Redis is down, wait and retry
   with a growing delay instead of crashing and relying on Docker to restart the process,
   and keep responding promptly to a stop request while waiting.
+- **Never log message contents.** Log ids, hashes and sizes, never HL7 payloads or patient
+  fields (names, MRNs), including in exception messages. The bytes belong in the raw
+  archive or the rejected area, where they are kept on purpose.
+- **Parameterized SQL only.** Pass values as query parameters, never by formatting them
+  into the SQL string.
 - **Comments explain why, briefly.** Don't restate the code, and don't copy rules from
   `AGENTS.md` or `DESIGN.md` into docstrings, where they drift; point to them instead.
 
