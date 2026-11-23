@@ -97,6 +97,16 @@ data/                  local raw archive, DuckDB files (gitignored)
   archive or the rejected area, where they are kept on purpose.
 - **Parameterized SQL only.** Pass values as query parameters, never by formatting them
   into the SQL string.
+- **Catch specific exceptions.** A catch-all `except Exception` belongs only at a boundary
+  (a connection loop, a retry loop, a last-resort fallback), with a comment saying why.
+- **No speculative code.** No options, parameters or helpers that nothing uses yet; add
+  them when the first caller needs them.
+- **Fail loudly on missing required input.** Use a default only where it is genuinely
+  right; don't hide a missing value behind `.get(key, default)` or `or ""`.
+- **Check library defaults that correctness depends on,** and make them explicit in the
+  code (for example, which bytes count as whitespace, rather than `bytes.strip()`).
+- **Don't silence ruff without a reason.** `make lint` enforces the mechanical rules; a
+  `# noqa` names the rule and says why (`# noqa: BLE001 - connection boundary`).
 - **Comments explain why, briefly.** Don't restate the code, and don't copy rules from
   `AGENTS.md` or `DESIGN.md` into docstrings, where they drift; point to them instead.
 
