@@ -62,24 +62,46 @@ def test_short_header_reads_what_is_there():
     assert h.error == "MSH-10 (message control ID) is empty"
 
 
+NO_MSH = "message does not start with an MSH segment"
+
+
 @pytest.mark.parametrize(
-    "raw",
-    [b"", b"hello world", b"PID|||123\r", b"MSH", b"MSHA^~\\&|x|y", b"\x00\xff\xfe" * 10],
+    ("raw", "error"),
+    [
+        (b"", NO_MSH),
+        (b"hello world", NO_MSH),
+        (b"PID|||123\r", NO_MSH),
+        (b"MSH", NO_MSH),
+        (b"MSH|^~\\", NO_MSH),  # too short to hold the encoding characters
+        (b"\x00\xff\xfe" * 10, NO_MSH),
+        (b"MSHA^~\\&|x|y", "invalid field separator 'A'"),
+        (b"MSH ^~\\&|x|y", "invalid field separator ' '"),
+    ],
 )
-def test_unreadable_header_returns_defaults_with_error(raw):
+def test_unreadable_header_returns_defaults_with_error(raw, error):
     h = read_msh(raw)
-    assert h.error
+    assert h.error == error
     assert h.control_id == ""
     assert h.field_sep == "|"
 
 
-def test_never_raises_on_random_bytes():
+def test_empty_message_type_is_an_error():
+    h = read_msh(b"MSH|^~\\&|APP|FAC|||20261120|||C1|P|2.5.1\r")
+    assert h.control_id == "C1"
+    assert h.error == "MSH-9 (message type) is empty"
+
+
+def test_random_bytes_never_reach_the_catch_all():
+    # read_msh's catch-all turns any bug into a generic error (which becomes the AR text
+    # and the DLQ reason), so it would hide bugs from every other test. Random input must
+    # always get one of the specific errors, or none.
     rng = random.Random(42)
     for _ in range(2000):
         raw = bytes(rng.randrange(256) for _ in range(rng.randrange(0, 80)))
         if rng.random() < 0.5:
             raw = b"MSH" + raw
-        read_msh(raw)  # must not raise
+        error = read_msh(raw).error or ""
+        assert not error.startswith("unexpected error"), (raw, error)
 
 
 def test_control_id_bytes_round_trip_into_the_ack():
