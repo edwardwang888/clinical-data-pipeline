@@ -18,14 +18,7 @@ LISTENER_FACILITY = "CDP"
 DEFAULT_VERSION = "2.5.1"
 
 
-def build_ack(
-    header: MshHeader,
-    code: str,
-    *,
-    text: str = "",
-    now: datetime | None = None,
-    ack_control_id: str | None = None,
-) -> bytes:
+def build_ack(header: MshHeader, code: str, *, text: str = "") -> bytes:
     """Return the ACK for the message whose header is `header`, as bytes (unframed).
 
     Sender and receiver are swapped relative to the original, and MSA-2 echoes the
@@ -36,7 +29,7 @@ def build_ack(
         raise ValueError(f"unknown acknowledgment code {code!r}")
     s = header.field_sep
     c = header.component_sep
-    now = now or datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     trigger = header.trigger_event
 
     msh = s.join(
@@ -50,7 +43,7 @@ def build_ack(
             f"{now.astimezone(timezone.utc):%Y%m%d%H%M%S}+0000",  # MSH-7
             "",  # MSH-8 security
             f"ACK{c}{trigger}{c}ACK" if trigger else "ACK",  # MSH-9
-            ack_control_id or uuid.uuid4().hex[:20],  # MSH-10: the ACK's own id
+            uuid.uuid4().hex[:20],  # MSH-10: the ACK's own id
             header.processing_id or "P",  # MSH-11
             header.version or DEFAULT_VERSION,  # MSH-12
         ]
