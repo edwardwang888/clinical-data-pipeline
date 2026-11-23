@@ -102,7 +102,9 @@ data/                  local raw archive, DuckDB files (gitignored)
 - **Extend an existing test before writing a parallel one.** If the setup is the same, add
   a parametrized case (as the restart test does for its five ways of going down).
 - **Use real processes and real Redis where the behaviour depends on them** (crashes,
-  signals, outages). Use fakes in unit tests to pin down exact ordering and failures.
+  signals, outages), and a subprocess only then. Otherwise call the code directly in the
+  test; to check that it stays fast, time the call on an input sized so a regression
+  takes seconds. Use fakes in unit tests to pin down exact ordering and failures.
 - **Make timing-dependent tests reliable.** Trigger events on progress (after N ACKs),
   not on sleeps; assert what must always hold, not exact counts.
 - **A new test must be able to fail.** Break the behaviour it covers once and check that
