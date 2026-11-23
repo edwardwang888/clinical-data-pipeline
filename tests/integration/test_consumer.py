@@ -2,6 +2,7 @@
 crash, and claiming events a dead consumer left behind."""
 
 import signal
+import socket
 import time
 from unittest import mock
 
@@ -208,6 +209,26 @@ def test_consumer_process_stops_promptly_while_waiting_for_redis(tmp_path):
         assert time.monotonic() - started < 1.0  # not the remaining ~4 s
     finally:
         consumer.kill()
+
+    assert "stopped" in log_path.read_text()
+
+
+def test_consumer_process_stops_while_redis_is_frozen(tmp_path):
+    # A Redis that accepts connections but never answers (frozen, or a network black
+    # hole). Without a socket timeout, the consumer would wait for a reply forever and
+    # never notice the stop request; with one, the call fails and the loop exits.
+    log_path = tmp_path / "consumer.log"
+    with socket.create_server(("127.0.0.1", 0)) as frozen:
+        frozen.settimeout(10)
+        consumer = start_consumer(f"redis://127.0.0.1:{frozen.getsockname()[1]}/0", "hl7.raw", log_path)
+        try:
+            connection, _ = frozen.accept()
+            with connection:
+                connection.recv(1024)  # its first command: now it waits for a reply
+                consumer.send_signal(signal.SIGTERM)
+                assert consumer.wait(timeout=10) == 0  # within the 5 s socket timeout
+        finally:
+            consumer.kill()
 
     assert "stopped" in log_path.read_text()
 

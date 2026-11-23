@@ -175,8 +175,14 @@ def main() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Explicit timeouts (older redis-py versions default to none): a hung Redis must turn
+    # into an error we retry, not a call that blocks forever and ignores a stop request.
+    # The read timeout must stay above the read wait in run_forever (block_ms, 1 s).
     client = redis.Redis.from_url(
-        os.environ.get("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True
+        os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+        decode_responses=True,
+        socket_timeout=5,
+        socket_connect_timeout=5,
     )
     consumer = RawEventConsumer(
         client,
