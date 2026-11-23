@@ -65,14 +65,16 @@ def send_against(script):
     async def main():
         server = await start_hl7_server(handle, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
-        sender = MllpSender("127.0.0.1", port, retry_delay=0.01, ack_timeout=2, max_attempts=5)
+        sender = MllpSender("127.0.0.1", port)
         try:
-            return await sender.send(MSG.raw, MSG.control_id)
+            # The sender resends forever, so stop the test if it never accepts an AA.
+            return await asyncio.wait_for(sender.send(MSG.raw, MSG.control_id), timeout=10)
         finally:
             await sender.close()
             server.close()
 
-    return asyncio.run(main()), received
+    with mock.patch("producer.sender.RETRY_DELAY", 0.01):  # no real waiting between resends
+        return asyncio.run(main()), received
 
 
 def test_sender_returns_after_aa():
@@ -96,8 +98,3 @@ def test_sender_resends_when_connection_drops_before_ack():
 def test_sender_gives_up_on_ar():
     with pytest.raises(SendFailed, match="rejected"):
         send_against(["AR"])
-
-
-def test_sender_gives_up_after_max_attempts():
-    with pytest.raises(SendFailed, match="5 attempts"):
-        send_against(["AE"] * 5)

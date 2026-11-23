@@ -15,6 +15,7 @@ import hashlib
 import json
 import signal
 from collections import defaultdict
+from unittest import mock
 
 import pytest
 
@@ -54,7 +55,7 @@ def test_no_acked_message_is_lost_when_listener_restarts(
     acked: dict[str, bytes] = {}  # control_id -> exact bytes, recorded only on AA
 
     async def send_batch(batch):
-        sender = MllpSender("127.0.0.1", port, retry_delay=0.05, max_retry_delay=0.5, ack_timeout=5)
+        sender = MllpSender("127.0.0.1", port)
         try:
             for m in batch:
                 await sender.send(m.raw, m.control_id)
@@ -83,7 +84,9 @@ def test_no_acked_message_is_lost_when_listener_restarts(
 
     listener.start()
     try:
-        resends = asyncio.run(main())
+        # Short resend delays: senders back off while the listener is down.
+        with mock.patch.multiple("producer.sender", RETRY_DELAY=0.05, MAX_RETRY_DELAY=0.5, ACK_TIMEOUT=5):
+            resends = asyncio.run(main())
     finally:
         listener.stop()
 

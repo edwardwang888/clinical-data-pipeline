@@ -1,8 +1,9 @@
 """Send messages over MLLP the way a hospital interface engine does.
 
 One message at a time per connection: send, wait for the ACK, then the next. If the
-ACK is AE, doesn't come within `ack_timeout`, or the connection drops, close the
-connection, wait a bit, reconnect and send *the same message again*. The receiver may
+ACK is AE, doesn't come within ACK_TIMEOUT, or the connection drops, close the
+connection, wait a bit, reconnect and send *the same message again*, for as long as it
+takes, like a real interface engine. The receiver may
 already have stored it, so this can create duplicates. That's expected: "resend until
 acknowledged" is what makes the feed lossless, and duplicates are handled downstream.
 """
@@ -16,6 +17,10 @@ import hl7
 from hl7.mllp import open_hl7_connection
 
 log = logging.getLogger(__name__)
+
+ACK_TIMEOUT = 10.0  # seconds to wait for an ACK before resending
+RETRY_DELAY = 0.5  # first wait before a resend; doubles after each failed attempt
+MAX_RETRY_DELAY = 10.0
 
 
 class SendFailed(Exception):
@@ -31,29 +36,16 @@ def read_ack(ack: bytes) -> tuple[str, str]:
 
 
 class MllpSender:
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        *,
-        ack_timeout: float = 10.0,
-        retry_delay: float = 0.5,
-        max_retry_delay: float = 10.0,
-        max_attempts: int | None = None,  # None: keep trying forever, like a real feed
-    ) -> None:
+    def __init__(self, host: str, port: int) -> None:
         self.host = host
         self.port = port
-        self.ack_timeout = ack_timeout
-        self.retry_delay = retry_delay
-        self.max_retry_delay = max_retry_delay
-        self.max_attempts = max_attempts
         self.resends = 0  # total extra attempts across all messages
         self._reader = None
         self._writer = None
 
     async def send(self, raw: bytes, control_id: str) -> int:
         """Send until we get AA for this exact control ID. Returns attempts used."""
-        delay = self.retry_delay
+        delay = RETRY_DELAY
         attempt = 0
         while True:
             attempt += 1
@@ -62,7 +54,7 @@ class MllpSender:
                     self._reader, self._writer = await open_hl7_connection(self.host, self.port)
                 self._writer.writeblock(raw)
                 await self._writer.drain()
-                ack = await asyncio.wait_for(self._reader.readblock(), self.ack_timeout)
+                ack = await asyncio.wait_for(self._reader.readblock(), ACK_TIMEOUT)
                 code, acked_id = read_ack(ack)
             except Exception as e:
                 # Connection refused/reset, ACK timeout, connection closed before the
@@ -79,12 +71,10 @@ class MllpSender:
             # Anything other than a matching AA: start again on a fresh connection, so a
             # late ACK for this attempt can't be mistaken for the next one.
             await self.close()
-            if self.max_attempts is not None and attempt >= self.max_attempts:
-                raise SendFailed(f"{control_id} not acknowledged after {attempt} attempts: {problem}")
             self.resends += 1
             log.warning("resending %s in %.2fs (attempt %d: %s)", control_id, delay, attempt, problem)
             await asyncio.sleep(delay)
-            delay = min(delay * 2, self.max_retry_delay)
+            delay = min(delay * 2, MAX_RETRY_DELAY)
 
     async def close(self) -> None:
         if self._writer is not None:
