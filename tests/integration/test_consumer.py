@@ -105,15 +105,17 @@ def test_events_held_by_a_dead_consumer_are_claimed(redis_client, stream_name):
 
 
 class FlakyClient:
-    """A real Redis client whose first `failures` calls fail as if Redis were down."""
+    """A real Redis client whose first `failures` calls (only to `method`, if given) fail
+    as if Redis were down."""
 
-    def __init__(self, inner, failures):
+    def __init__(self, inner, failures, method=None):
         self.inner = inner
         self.failures = failures
+        self.method = method
 
     def __getattr__(self, name):
         attr = getattr(self.inner, name)
-        if not callable(attr):
+        if not callable(attr) or (self.method and name != self.method):
             return attr
 
         def call(*args, **kwargs):
@@ -146,22 +148,22 @@ def test_consumer_waits_out_a_redis_outage_instead_of_crashing(redis_client, str
 
 
 def test_consumer_rereads_its_pending_events_after_reconnecting(redis_client, stream_name):
-    # c1 received an event but never XACKed it (say Redis went down mid-handling).
-    RawEventConsumer(redis_client, stream_name, consumer="c1").ensure_group()
+    # Redis goes away after the consumer handled an event but before its XACK. The event
+    # is still pending for c1, so reading new events (">") would never return it: after
+    # reconnecting, the consumer must re-read its own pending events first.
     publish(redis_client, stream_name, 1)
-    redis_client.xreadgroup(DEFAULT_GROUP, "c1", {stream_name: ">"}, count=10)
-
     seen = []
     consumer = RawEventConsumer(
-        FlakyClient(redis_client, failures=1),
+        FlakyClient(redis_client, failures=1, method="xack"),
         stream_name,
         consumer="c1",
         handler=lambda i, f: seen.append(f["control_id"]),
     )
+    give_up = time.monotonic() + 3  # without the re-read, the second delivery never comes
     with mock.patch("pipeline.consumer._wait"):  # no real waiting between reconnects
-        consumer.run_forever(block_ms=100, should_stop=lambda: len(seen) == 1)
+        consumer.run_forever(block_ms=100, should_stop=lambda: len(seen) == 2 or time.monotonic() > give_up)
 
-    assert seen == ["C0"]
+    assert seen == ["C0", "C0"]  # handled again after reconnecting: at least once
     assert pending_count(redis_client, stream_name) == 0
 
 
