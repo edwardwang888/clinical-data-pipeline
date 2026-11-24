@@ -1,0 +1,232 @@
+"""The MLLP listener: receive -> store raw bytes -> publish event -> ACK.
+
+The one rule this module exists to enforce: **never ACK a message we could still
+lose.** An AA goes back to the sender only after the raw bytes are fsynced to the
+archive AND the queue event is published. If either step fails we send AE (and the
+sender resends); if we crash before ACKing, the sender times out and resends. Either
+way the worst case is a duplicate, which downstream consumers handle. A loss is not
+possible.
+
+The listener does not parse. It reads only the few MSH fields it needs (see msh.py).
+If it can't read them, it can't identify the message: there is no control ID the
+sender could match an ACK to, and nothing to queue it under. It then keeps the exact
+bytes as evidence in a separate "rejected" store, never queues them, and replies AR
+("rejected, don't resend") so the sender's team can investigate. Messages with a
+readable header are always stored and ACKed, however wrong their contents; the parser
+quarantines those later, so problems inside a message never stall the feed.
+
+Nothing is dropped silently, and bad input goes to the dead-letter queue (hl7.dlq), not
+to the logs: every unidentifiable message, and any bytes that aren't a usable frame (the
+`kind`s in framing.py, plus abandoned frames), is kept in the rejected store and gets a
+DLQ entry pointing at that evidence. `_dead_letter` describes the fallbacks.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import logging
+from datetime import datetime, timezone
+
+from pipeline.publisher import Publisher
+from pipeline.raw_store import RawStore, SavedRaw, safe_segment
+from services.listener.ack import build_ack
+from services.listener.framing import read_block, split_abandoned
+from services.listener.msh import MshHeader, read_msh
+
+log = logging.getLogger(__name__)
+
+LISTENER_VERSION = "0.1.0"
+SOURCE_SYSTEM = "hl7v2"
+ABANDONED_FRAME = "abandoned partial frame: the sender started a new frame before finishing this one"
+
+
+class Listener:
+    def __init__(
+        self, store: RawStore, publisher: Publisher, rejected_store: RawStore, dead_letters: Publisher
+    ) -> None:
+        self.store = store  # the raw archive: every message we can identify
+        self.publisher = publisher  # hl7.raw: events for messages to process
+        self.rejected_store = rejected_store  # evidence files for bad input
+        self.dead_letters = dead_letters  # hl7.dlq: one entry per bad input
+        self._connections: set[asyncio.Task] = set()
+
+    async def handle_connection(self, reader: asyncio.StreamReader, writer) -> None:
+        """Serve one sender connection: one message at a time, each answered by an ACK.
+
+        `writer` is python-hl7's HL7StreamWriter; `writeblock` adds the MLLP framing.
+        """
+        task = asyncio.current_task()
+        self._connections.add(task)
+        peer = _format_peer(writer.get_extra_info("peername"))
+        log.info("connection opened peer=%s", peer)
+        try:
+            while True:
+                block = await read_block(reader)
+                if block.discarded:
+                    await self._dead_letter(block.discarded, block.kind, block.reason, peer)
+                if block.too_large:
+                    log.error("closing connection peer=%s: %s", peer, block.reason)
+                    break  # can't find the next frame boundary reliably
+                if block.end_of_stream:
+                    break  # sender closed the connection
+                if block.payload is None:
+                    continue  # no usable frame (kept above); nothing to answer
+
+                # If the sender abandoned a frame and started a new one, handle the new
+                # message on its own; the abandoned part is kept as evidence, no reply.
+                abandoned, raw = split_abandoned(block.payload)
+                if abandoned:
+                    await self._dead_letter(abandoned, "abandoned_frame", ABANDONED_FRAME, peer)
+
+                ack = await self.handle_message(raw, peer)
+                writer.writeblock(ack)
+                await writer.drain()
+        except ConnectionError as e:
+            # Sender went away. Anything not yet ACKed will be resent by it.
+            log.info("connection lost peer=%s: %s", peer, e)
+        except Exception:
+            log.exception("unexpected error, closing connection peer=%s", peer)
+        finally:
+            self._connections.discard(task)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, asyncio.CancelledError):
+                pass
+            log.info("connection closed peer=%s", peer)
+
+    async def handle_message(self, raw: bytes, peer: str) -> bytes:
+        """Store `raw`, publish its event, and return the ACK bytes to send back.
+
+        Returns AA only if both the save and the publish succeeded; otherwise AE.
+        A message whose header can't be read is kept as evidence and gets AR.
+        """
+        received_at = datetime.now(timezone.utc)
+        header = read_msh(raw)
+        meta = _metadata(header, received_at, peer)
+        if header.error:
+            return await self._reject(raw, header, meta, peer)
+
+        try:
+            # File I/O and the Redis call block, so run them in a worker thread to keep
+            # other connections flowing meanwhile.
+            saved = await asyncio.to_thread(self.store.save_raw, raw, meta)
+            event = {
+                "raw_key": saved.key,
+                "raw_message_id": saved.sha256,
+                "source_system": SOURCE_SYSTEM,
+                "hospital": meta["hospital"],
+                "feed": meta["feed"],
+                "message_type": header.message_type,
+                "control_id": header.control_id,
+                "received_at": received_at.isoformat(),
+            }
+            event_id = await asyncio.to_thread(self.publisher.publish, event)
+        except Exception:
+            log.exception("NOT stored and queued, sending AE peer=%s control_id=%s", peer, header.control_id)
+            # The raw file may already be saved; it's the queueing that didn't happen.
+            return build_ack(header, "AE", text="message not queued; please resend")
+
+        log.info(
+            "stored and queued control_id=%s type=%s key=%s event=%s",
+            header.control_id,
+            header.message_type,
+            saved.key,
+            event_id,
+        )
+        return build_ack(header, "AA")
+
+    async def _reject(self, raw: bytes, header: MshHeader, meta: dict, peer: str) -> bytes:
+        """Keep an unidentifiable message as evidence, dead-letter it, then reply AR.
+
+        Same rule as AA: the reply goes out only once the evidence file is saved AND the
+        DLQ entry is published. If either fails we reply AE and the sender tries again.
+        """
+        try:
+            saved = await asyncio.to_thread(self.rejected_store.save_raw, raw, meta)
+            entry = _dead_letter_entry(raw, "unidentifiable", header.error, meta, saved, reply="AR")
+            await asyncio.to_thread(self.dead_letters.publish, entry)
+        except Exception:
+            log.exception("could not record rejected message, sending AE peer=%s", peer)
+            return build_ack(header, "AE", text="message not recorded; please resend")
+        log.debug("rejected (AR) peer=%s reason=%s evidence=%s", peer, header.error, saved.key)
+        return build_ack(header, "AR", text=f"rejected: {header.error}")
+
+    async def _dead_letter(self, data: bytes, kind: str, reason: str, peer: str) -> None:
+        """Record bytes that aren't a usable message: evidence file + DLQ entry. No reply.
+
+        None of these was a complete frame, so the sender isn't waiting for an answer to
+        it (and resends whatever was real). This must never hold up the messages around
+        it, so failures fall back instead of raising: if the evidence file can't be
+        saved, the DLQ entry carries the bytes; if the DLQ is unreachable, the log does.
+        """
+        meta = _metadata(read_msh(data), datetime.now(timezone.utc), peer)
+        meta["header_error"] = reason
+        saved = None
+        try:
+            saved = await asyncio.to_thread(self.rejected_store.save_raw, data, meta)
+        except Exception:
+            log.exception("could not save evidence file; the DLQ entry will carry the bytes peer=%s", peer)
+        try:
+            entry = _dead_letter_entry(data, kind, reason, meta, saved, reply="none")
+            await asyncio.to_thread(self.dead_letters.publish, entry)
+        except Exception:
+            # Last resort: the DLQ itself is down. Record enough to trace the input.
+            log.exception(
+                "DLQ unavailable: bad input not dead-lettered peer=%s kind=%s bytes=%d sha256=%s evidence=%s",
+                peer, kind, len(data), hashlib.sha256(data).hexdigest(), saved.key if saved else "(none)",
+            )
+
+    async def close_connections(self) -> None:
+        """Stop serving open connections (used on shutdown). In-flight messages that
+        were not ACKed yet will be resent by their senders."""
+        for task in list(self._connections):
+            task.cancel()
+        await asyncio.gather(*self._connections, return_exceptions=True)
+
+
+def _metadata(header: MshHeader, received_at: datetime, peer: str) -> dict:
+    """What we record next to every stored message (raw or rejected)."""
+    return {
+        "received_at": received_at,
+        "hospital": safe_segment(header.facility_id),
+        "feed": safe_segment(header.message_code),
+        "peer": peer,
+        "sending_facility": header.sending_facility,
+        "message_type": header.message_type,
+        "control_id": header.control_id,
+        "header_error": header.error,
+        "source_system": SOURCE_SYSTEM,
+        "listener_version": LISTENER_VERSION,
+    }
+
+
+def _dead_letter_entry(
+    data: bytes, kind: str, reason: str, meta: dict, saved: SavedRaw | None, reply: str
+) -> dict:
+    """One DLQ entry: what the bad input was, why, what we replied, and where it is."""
+    entry = {
+        "stage": "listener",
+        "kind": kind,
+        "reason": reason,
+        "reply": reply,  # "AR", or "none" when the sender got no answer for it
+        "evidence_key": saved.key if saved else "",
+        "raw_message_id": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+        "control_id": meta["control_id"],
+        "peer": meta["peer"],
+        "received_at": meta["received_at"].isoformat(),
+        "source_system": SOURCE_SYSTEM,
+    }
+    if saved is None:
+        # No evidence file: keep the bytes in the entry itself.
+        entry["payload_b64"] = base64.b64encode(data).decode("ascii")
+    return entry
+
+
+def _format_peer(peername) -> str:
+    if isinstance(peername, tuple) and len(peername) >= 2:
+        return f"{peername[0]}:{peername[1]}"
+    return str(peername)

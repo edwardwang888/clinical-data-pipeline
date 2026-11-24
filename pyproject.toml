@@ -1,0 +1,26 @@
+[project]
+name = "clinical-data-pipeline"
+version = "0.1.0"
+description = "Practice pipeline for synthetic HL7 v2 hospital data"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "hl7>=0.4.5",
+    "redis>=5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+# This is an application, not a library: don't build or install it as a package.
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "integration: needs Redis and starts real listener processes (slower)",
+]
