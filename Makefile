@@ -1,4 +1,4 @@
-.PHONY: up down logs dlq test test-local
+.PHONY: up down logs dlq test test-local lint
 
 # Containers run as you, so files the listener writes to data/raw are yours, not root's.
 export HOST_UID := $(shell id -u)
@@ -30,3 +30,7 @@ test:
 ## Run the tests on this machine with uv (Redis tests need redis-server installed).
 test-local:
 	uv run pytest
+
+## Check the code with ruff (rules in pyproject.toml). Needs uv.
+lint:
+	uv run ruff check .

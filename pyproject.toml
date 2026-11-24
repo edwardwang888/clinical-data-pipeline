@@ -12,6 +12,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "ruff>=0.17.6",
 ]
 
 [tool.uv]
@@ -24,3 +25,27 @@ testpaths = ["tests"]
 markers = [
     "integration: needs Redis and starts real listener processes (slower)",
 ]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+# Each family catches a mistake that's easy to make and easy to miss in review.
+select = [
+    "F",      # pyflakes: unused imports and variables, undefined names
+    "E",      # pycodestyle errors (incl. bare except, line length)
+    "B",      # bugbear: mutable defaults, raise without `from`, loop-variable traps
+    "BLE",    # blind `except Exception:` (allow only with a reason: `# noqa: BLE001 - why`)
+    "ARG",    # unused function arguments
+    "SIM115", # open() outside a `with` block
+    "DTZ",    # timezone-naive datetimes
+    "S",      # security: assert for runtime checks, SQL built from strings, shell=True
+    "ASYNC",  # blocking calls inside async functions
+    "G",      # logging calls that format eagerly (f-strings) instead of passing args
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert by design, start subprocesses with fixed arguments, use lambdas whose
+# arguments are part of a callback signature, poll in small sleep loops, and use
+# seeded random numbers for test data.
+"tests/**" = ["S101", "S603", "S607", "ARG", "ASYNC109", "ASYNC110", "S311"]
