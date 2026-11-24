@@ -33,6 +33,10 @@ log = logging.getLogger("pipeline.consumer")  # stable name even when run with -
 
 DEFAULT_GROUP = "raw-logger"
 BATCH = 100
+# Stream ids are "<milliseconds>-<sequence>", so "0-0" comes before every real event:
+# reading or claiming from it starts at the beginning of the stream. XAUTOCLAIM also
+# returns it as the next place to start once its scan has gone through everything.
+STREAM_START = "0-0"
 
 Handler = Callable[[str, dict[str, str]], None]
 
@@ -65,11 +69,10 @@ class RawEventConsumer:
         self.claim_idle_ms = claim_idle_ms
 
     def ensure_group(self) -> None:
-        """Create the consumer group if needed. id="0" means a new group starts from
-        the beginning of the stream, so events published before it existed are not
-        skipped."""
+        """Create the consumer group if needed. A new group starts at the beginning of
+        the stream, so events published before it existed are not skipped."""
         try:
-            self.client.xgroup_create(self.stream, self.group, id="0", mkstream=True)
+            self.client.xgroup_create(self.stream, self.group, id=STREAM_START, mkstream=True)
         except redis.ResponseError as e:
             # A Redis error starts with its code ("BUSYGROUP Consumer Group name already
             # exists"); the rest is free text that may change. redis-py has no exception
@@ -82,7 +85,7 @@ class RawEventConsumer:
         handled = 0
         # Reading from an explicit id (instead of ">") returns our pending events after
         # that id. Walk forward so an event that fails again doesn't loop forever.
-        start = "0"
+        start = STREAM_START
         while True:
             entries = self._read(start, block_ms=None)
             if not entries:
@@ -93,13 +96,13 @@ class RawEventConsumer:
     def claim_stale(self) -> int:
         """Take over events another consumer has held for too long without XACKing."""
         handled = 0
-        start = "0-0"
+        start = STREAM_START
         while True:
             next_start, entries, *_ = self.client.xautoclaim(
                 self.stream, self.group, self.consumer, self.claim_idle_ms, start, count=BATCH
             )
             handled += self._handle(entries)
-            if next_start == "0-0":  # the scan wrapped around: nothing left to claim
+            if next_start == STREAM_START:  # the scan is done: nothing left to claim
                 return handled
             start = next_start
 
