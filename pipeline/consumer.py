@@ -37,6 +37,8 @@ BATCH = 100
 # reading or claiming from it starts at the beginning of the stream. XAUTOCLAIM also
 # returns it as the next place to start once its scan has gone through everything.
 STREAM_START = "0-0"
+# XREADGROUP's special id for "events never delivered to any consumer in this group".
+NEW_EVENTS = ">"
 
 Handler = Callable[[str, dict[str, str]], None]
 
@@ -83,8 +85,8 @@ class RawEventConsumer:
     def process_own_pending(self) -> int:
         """Re-handle events delivered to this consumer earlier but never XACKed."""
         handled = 0
-        # Reading from an explicit id (instead of ">") returns our pending events after
-        # that id. Walk forward so an event that fails again doesn't loop forever.
+        # Reading from an explicit id (instead of NEW_EVENTS) returns our pending events
+        # after that id. Walk forward so an event that fails again doesn't loop forever.
         start = STREAM_START
         while True:
             entries = self._read(start, block_ms=None)
@@ -108,7 +110,7 @@ class RawEventConsumer:
 
     def process_new(self, block_ms: int | None = 1000) -> int:
         """Handle events never delivered to anyone yet (waits up to `block_ms`)."""
-        return self._handle(self._read(">", block_ms))
+        return self._handle(self._read(NEW_EVENTS, block_ms))
 
     def run_forever(
         self,
