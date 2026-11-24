@@ -51,6 +51,14 @@ def test_ensure_group_is_safe_to_call_twice(redis_client, stream_name):
     consumer.ensure_group()
 
 
+def test_ensure_group_raises_other_redis_errors(redis_client, stream_name):
+    # Only "the group already exists" is expected; any other error must not be swallowed.
+    redis_client.set(stream_name, "not a stream")
+    consumer = RawEventConsumer(redis_client, stream_name, consumer="c1")
+    with pytest.raises(redis.ResponseError, match="^WRONGTYPE"):
+        consumer.ensure_group()
+
+
 def test_failed_event_stays_pending_and_is_redelivered_after_restart(redis_client, stream_name):
     def crash_on_c1(event_id, fields):
         if fields["control_id"] == "C1":

@@ -71,7 +71,10 @@ class RawEventConsumer:
         try:
             self.client.xgroup_create(self.stream, self.group, id="0", mkstream=True)
         except redis.ResponseError as e:
-            if "BUSYGROUP" not in str(e):  # BUSYGROUP = the group already exists
+            # A Redis error starts with its code ("BUSYGROUP Consumer Group name already
+            # exists"); the rest is free text that may change. redis-py has no exception
+            # class for this code, so compare the code itself, as redis-py's own parser does.
+            if str(e).split(" ", 1)[0] != "BUSYGROUP":  # anything but "group already exists"
                 raise
 
     def process_own_pending(self) -> int:
